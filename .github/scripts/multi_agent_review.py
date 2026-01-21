@@ -4,6 +4,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import urllib.request
 
 DIFF_PATH = Path("diff.txt")
 GUIDELINES_PATH = Path("docs/review_guidelines.md")
@@ -11,6 +12,7 @@ OUT_MD = Path("review_comment.md")
 
 MODEL = os.environ.get("MODEL", "qwen2.5:14b-instruct")
 MAX_DIFF_CHARS = int(os.environ.get("MAX_DIFF_CHARS", "80000"))
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 
 # --- Utilities ---
 
@@ -20,18 +22,26 @@ def read_text(path: Path) -> str:
     return ""
 
 def run_ollama(model: str, prompt: str) -> str:
-    # Use stdin to avoid CLI arg limits on Windows.
-    p = subprocess.run(
-        ["ollama", "run", model],
-        input=prompt.encode("utf-8"),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+    }
+
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/generate",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
-    if p.returncode != 0:
-        err = p.stderr.decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Ollama failed (code={p.returncode}): {err[:2000]}")
-    return p.stdout.decode("utf-8", errors="ignore").strip()
+
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            data = json.loads(body)
+            return data.get("response", "").strip()
+    except Exception as e:
+        raise RuntimeError(f"Ollama HTTP call failed: {e}")
 
 def safe_json_loads(s: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
@@ -39,14 +49,17 @@ def safe_json_loads(s: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     except Exception as e:
         return None, str(e)
 
+
 def truncate(s: str, limit: int) -> str:
     if len(s) <= limit:
         return s
     return s[:limit] + "\n\n[TRUNCATED]\n"
 
+
 def md_escape(s: str) -> str:
     # Minimal escaping to avoid accidental markdown formatting explosions
     return s.replace("\r", "").strip()
+
 
 # --- Agent definitions ---
 
@@ -54,6 +67,7 @@ def md_escape(s: str) -> str:
 class Agent:
     name: str
     focus: str
+
 
 AGENTS: List[Agent] = [
     Agent(
@@ -103,6 +117,7 @@ Rules:
 - Keep evidence concrete (file/line hints if visible in diff).
 """.strip()
 
+
 def build_prompt(agent: Agent, guidelines: str, diff: str) -> str:
     return f"""
 SYSTEM:
@@ -121,6 +136,7 @@ OUTPUT INSTRUCTIONS:
 {JSON_SCHEMA}
 """.strip()
 
+
 # --- Markdown report building ---
 
 def fmt_issue_list(title: str, issues: List[Dict[str, Any]]) -> str:
@@ -134,6 +150,7 @@ def fmt_issue_list(title: str, issues: List[Dict[str, Any]]) -> str:
         out += f"- **{issue}**\n  - Evidence: {evidence}\n  - Fix: {fix}\n"
     return out + "\n"
 
+
 def fmt_list(title: str, items: List[str]) -> str:
     if not items:
         return f"**{title}:** None\n\n"
@@ -141,6 +158,7 @@ def fmt_list(title: str, items: List[str]) -> str:
     for x in items:
         out += f"- {md_escape(str(x))}\n"
     return out + "\n"
+
 
 def main() -> None:
     diff = read_text(DIFF_PATH)
@@ -188,13 +206,14 @@ def main() -> None:
             md += "\n```\n\n"
             continue
 
-        md += f"**Summary:** {md_escape(str(data.get('summary','')))}\n\n"
+        md += f"**Summary:** {md_escape(str(data.get('summary', '')))}\n\n"
         md += fmt_issue_list("Blocking", data.get("blocking", []) or [])
         md += fmt_issue_list("Non-blocking", data.get("non_blocking", []) or [])
         md += fmt_list("Tests to add", data.get("tests_to_add", []) or [])
         md += fmt_list("Questions", data.get("questions", []) or [])
 
     OUT_MD.write_text(md, encoding="utf-8")
+
 
 if __name__ == "__main__":
     main()
