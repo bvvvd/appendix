@@ -22,26 +22,51 @@ jobs:
         run: |
           git fetch origin ${{ github.base_ref }} --depth=1
 
-      - name: Build diff
+      - name: Get previous AI review SHA (if any)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $pr = "${{ github.event.pull_request.number }}"
+          $comments = gh api repos/${{ github.repository }}/issues/$pr/comments | ConvertFrom-Json
+          $ai = $comments | Where-Object { $_.body -match "Reviewed-Head-SHA:" } | Select-Object -Last 1
+          if ($null -ne $ai) {
+            $m = [regex]::Match($ai.body, "Reviewed-Head-SHA:\s*([0-9a-fA-F]+)")
+            if ($m.Success) {
+              "PREV_SHA=$($m.Groups[1].Value)" | Out-File -FilePath $env:GITHUB_ENV -Append
+              Write-Host "Found previous review SHA: $($m.Groups[1].Value)"
+            }
+          } else {
+            Write-Host "No previous AI review comment found."
+          }
+
+      - name: Build diff (incremental if possible)
         shell: pwsh
         run: |
-          git diff --unified=3 origin/${{ github.base_ref }}...HEAD > diff.txt
+          git fetch origin ${{ github.base_ref }} --depth=1
+
+          if ($env:PREV_SHA) {
+            # Validate that PREV_SHA exists in this checkout (force-push can break it)
+            git cat-file -e "$env:PREV_SHA^{commit}" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              git diff --unified=3 $env:PREV_SHA...HEAD > diff.txt
+              Write-Host "Using incremental diff: $env:PREV_SHA...HEAD"
+            } else {
+              Write-Host "PREV_SHA not found locally (maybe force-push). Falling back to full diff."
+              git diff --unified=3 origin/${{ github.base_ref }}...HEAD > diff.txt
+            }
+          } else {
+            git diff --unified=3 origin/${{ github.base_ref }}...HEAD > diff.txt
+            Write-Host "Using full PR diff against base."
+          }
+
           Get-Content diff.txt | Measure-Object -Line -Word -Character | Format-List
-
-      - name: Debug Python resolution
-        shell: pwsh
-        run: |
-          echo "PATH=$env:PATH"
-          where.exe python || echo "where.exe can't find python"
-          Get-Command python -All || echo "Get-Command can't find python"
-          Test-Path "C:\Users\zxc\AppData\Local\Programs\Python\Python314\python.exe"
-          Get-ChildItem "C:\Users\zxc\AppData\Local\Programs\Python\Python314\" -Filter python*.exe -ErrorAction SilentlyContinue
-
 
       - name: Run multi-agent local review
         shell: pwsh
         env:
-          MODEL: qwen2.5.:14b-instruct
+          MODEL: qwen2.5:14b-instruct
+          MAX_DIFF_CHARS: "80000"
         run: |
           python .github/scripts/multi_agent_review.py
 
@@ -50,4 +75,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh pr comment ${{ github.event.pull_request.number }} --body-file review_comment.md
+          $pr = "${{ github.event.pull_request.number }}"
+          # Try to edit last comment; if it fails, create a new one.
+          gh pr comment $pr --edit-last --body-file review_comment.md
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Edit-last failed, creating a new comment."
+            gh pr comment $pr --body-file review_comment.md
+          }

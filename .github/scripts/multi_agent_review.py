@@ -14,6 +14,11 @@ MODEL = os.environ.get("MODEL", "qwen2.5:14b-instruct")
 MAX_DIFF_CHARS = int(os.environ.get("MAX_DIFF_CHARS", "80000"))
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 
+# Set in workflow (optional) by parsing previous AI comment:
+# PREV_SHA=<sha>
+PREV_SHA = (os.environ.get("PREV_SHA") or "").strip()
+
+
 # --- Utilities ---
 
 def read_text(path: Path) -> str:
@@ -21,11 +26,32 @@ def read_text(path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="ignore")
     return ""
 
+
+def git(*args: str) -> str:
+    p = subprocess.run(
+        ["git", *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if p.returncode != 0:
+        err = p.stderr.decode("utf-8", errors="ignore")
+        raise RuntimeError(f"git {' '.join(args)} failed: {err[:2000]}")
+    return p.stdout.decode("utf-8", errors="ignore").strip()
+
+
+def get_head_sha() -> str:
+    # Works in GHA runner after checkout
+    return git("rev-parse", "HEAD")
+
+
 def run_ollama(model: str, prompt: str) -> str:
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": False,
+        # If you want to aggressively unload after each call:
+        # "keep_alive": 0,
     }
 
     req = urllib.request.Request(
@@ -42,6 +68,7 @@ def run_ollama(model: str, prompt: str) -> str:
             return data.get("response", "").strip()
     except Exception as e:
         raise RuntimeError(f"Ollama HTTP call failed: {e}")
+
 
 def safe_json_loads(s: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
@@ -102,7 +129,9 @@ AGENTS: List[Agent] = [
 
 # JSON schema agent must output
 JSON_SCHEMA = """
-Return ONLY valid JSON (no markdown, no extra text).
+Return ONLY valid JSON. No markdown. No explanations. No extra keys. No trailing comments.
+Any output outside JSON is considered a failure.
+
 Schema:
 {
   "summary": "string (1-3 sentences)",
@@ -111,17 +140,32 @@ Schema:
   "tests_to_add": ["string"],
   "questions": ["string"]
 }
+
 Rules:
 - Use only the provided DIFF and GUIDELINES.
-- Do not guess. If uncertain, put it into "questions".
+- Do not guess. If uncertain, put it into "questions" and set evidence to "unknown".
 - Keep evidence concrete (file/line hints if visible in diff).
 """.strip()
 
 
-def build_prompt(agent: Agent, guidelines: str, diff: str) -> str:
+def build_prompt(agent: Agent, guidelines: str, diff: str, mode: str, prev_sha: str, head_sha: str) -> str:
+    followup_hint = ""
+    if mode == "FOLLOW_UP":
+        followup_hint = f"""
+FOLLOW-UP CONTEXT:
+- This is a follow-up review after previous AI feedback.
+- Previous reviewed HEAD SHA was: {prev_sha}
+- Current HEAD SHA is: {head_sha}
+- The DIFF is expected to contain ONLY changes since the previous review.
+- Focus on verifying whether prior likely issues are addressed, and whether new issues were introduced.
+""".strip()
+
     return f"""
 SYSTEM:
-You are a strict senior software engineer acting as a pull request reviewer.
+You are a strict senior/staff+ software engineer acting as a pull request reviewer.
+
+MODE: {mode}
+{followup_hint}
 
 TASK:
 {agent.focus}
@@ -170,18 +214,39 @@ def main() -> None:
 
     diff = truncate(diff, MAX_DIFF_CHARS)
 
+    head_sha = get_head_sha()
+    mode = "FOLLOW_UP" if PREV_SHA else "INITIAL"
+
     results: List[Tuple[Agent, Optional[Dict[str, Any]], Optional[str], str]] = []
     # tuple: (agent, json, json_error, raw)
 
     for agent in AGENTS:
-        prompt = build_prompt(agent, guidelines, diff)
+        prompt = build_prompt(
+            agent=agent,
+            guidelines=guidelines,
+            diff=diff,
+            mode=mode,
+            prev_sha=PREV_SHA,
+            head_sha=head_sha,
+        )
         raw = run_ollama(MODEL, prompt)
         data, err = safe_json_loads(raw)
         results.append((agent, data, err, raw))
 
     # Build consolidated markdown
-    md = "### Local Multi-Agent AI Review\n\n"
+    title = "Local Multi-Agent AI Review"
+    if mode == "FOLLOW_UP":
+        title += " (Follow-up)"
+    else:
+        title += " (Initial)"
+
+    md = f"### {title}\n\n"
     md += f"Model: `{MODEL}`\n\n"
+    md += f"Current HEAD: `{head_sha}`\n"
+    if PREV_SHA:
+        md += f"Previous reviewed HEAD: `{PREV_SHA}`\n"
+    md += "\n"
+
     if guidelines.strip():
         md += "_Project guidelines were provided._\n\n"
 
@@ -211,6 +276,10 @@ def main() -> None:
         md += fmt_issue_list("Non-blocking", data.get("non_blocking", []) or [])
         md += fmt_list("Tests to add", data.get("tests_to_add", []) or [])
         md += fmt_list("Questions", data.get("questions", []) or [])
+
+    # Marker for next run to pick up
+    md += "\n---\n\n"
+    md += f"Reviewed-Head-SHA: {head_sha}\n"
 
     OUT_MD.write_text(md, encoding="utf-8")
 
