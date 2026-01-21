@@ -28,6 +28,16 @@ jobs:
           git diff --unified=3 origin/${{ github.base_ref }}...HEAD > diff.txt
           Get-Content diff.txt | Measure-Object -Line -Word -Character | Format-List
 
+      - name: Debug Python resolution
+        shell: pwsh
+        run: |
+          echo "PATH=$env:PATH"
+          where.exe python || echo "where.exe can't find python"
+          Get-Command python -All || echo "Get-Command can't find python"
+          Test-Path "C:\Users\zxc\AppData\Local\Programs\Python\Python314\python.exe"
+          Get-ChildItem "C:\Users\zxc\AppData\Local\Programs\Python\Python314\" -Filter python*.exe -ErrorAction SilentlyContinue
+
+
       - name: Run multi-agent local review
         shell: pwsh
         env:
