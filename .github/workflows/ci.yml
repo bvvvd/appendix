@@ -1,5 +1,9 @@
 name: code-review
 
+defaults:
+  run:
+    shell: pwsh
+
 on:
   pull_request:
 
