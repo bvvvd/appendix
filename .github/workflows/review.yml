@@ -28,6 +28,12 @@ jobs:
           git diff --unified=3 origin/${{ github.base_ref }}...HEAD > diff.txt
           Get-Content diff.txt | Measure-Object -Line -Word -Character | Format-List
 
+      - name: Debug PATH
+        shell: pwsh
+        run: |
+          echo $env:PATH
+          where.exe python
+
       - name: Run multi-agent local review
         shell: pwsh
         env:
