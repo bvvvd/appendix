@@ -1,0 +1,43 @@
+name: auto code review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  review:
+    runs-on: [self-hosted, appendix-reviewer]
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch PR base
+        shell: pwsh
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+
+      - name: Build diff
+        shell: pwsh
+        run: |
+          git diff --unified=3 origin/${{ github.base_ref }}...HEAD > diff.txt
+          Get-Content diff.txt | Measure-Object -Line -Word -Character | Format-List
+
+      - name: Run multi-agent local review
+        shell: pwsh
+        env:
+          MODEL: qwen2.5.:14b-instruct
+        run: |
+          python .github/scripts/multi_agent_review.py
+
+      - name: Post comment to PR
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} --body-file review_comment.md
