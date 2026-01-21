@@ -31,7 +31,7 @@ jobs:
           $comments = gh api repos/${{ github.repository }}/issues/$pr/comments | ConvertFrom-Json
           $ai = $comments | Where-Object { $_.body -match "Reviewed-Head-SHA:" } | Select-Object -Last 1
           if ($null -ne $ai) {
-            $m = [regex]::Match($ai.body, "Reviewed-Head-SHA:\s*([0-9a-fA-F]+)")
+            $m = [regex]::Match($ai.body, "AI_REVIEW:HEAD_SHA=([0-9a-fA-F]{7,40})")
             if ($m.Success) {
               "PREV_SHA=$($m.Groups[1].Value)" | Out-File -FilePath $env:GITHUB_ENV -Append
               Write-Host "Found previous review SHA: $($m.Groups[1].Value)"

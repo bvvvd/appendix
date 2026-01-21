@@ -279,7 +279,7 @@ def main() -> None:
 
     # Marker for next run to pick up
     md += "\n---\n\n"
-    md += f"Reviewed-Head-SHA: {head_sha}\n"
+    md += f"<!-- AI_REVIEW:HEAD_SHA={head_sha} -->"
 
     OUT_MD.write_text(md, encoding="utf-8")
 
