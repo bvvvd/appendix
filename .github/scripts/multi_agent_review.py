@@ -11,12 +11,15 @@ GUIDELINES_PATH = Path("docs/review_guidelines.md")
 OUT_MD = Path("review_comment.md")
 
 MODEL = os.environ.get("MODEL", "qwen2.5:14b-instruct")
-MAX_DIFF_CHARS = int(os.environ.get("MAX_DIFF_CHARS", "80000"))
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
+# Optional: use a cheaper/faster model for the curator step
+CURATOR_MODEL = os.environ.get("CURATOR_MODEL", MODEL)
 
-# Set in workflow (optional) by parsing previous AI comment:
-# PREV_SHA=<sha>
+MAX_DIFF_CHARS = int(os.environ.get("MAX_DIFF_CHARS", "80000"))
+MAX_PREV_REVIEW_CHARS = int(os.environ.get("MAX_PREV_REVIEW_CHARS", "12000"))
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 PREV_SHA = (os.environ.get("PREV_SHA") or "").strip()
+PREV_REVIEW_PATH = Path(os.environ.get("PREV_REVIEW_PATH", "prev_review.txt"))  # optional
 
 
 # --- Utilities ---
@@ -41,11 +44,21 @@ def git(*args: str) -> str:
 
 
 def get_head_sha() -> str:
-    # Works in GHA runner after checkout
     return git("rev-parse", "HEAD")
 
 
-def run_ollama(model: str, prompt: str) -> str:
+def truncate(s: str, limit: int) -> str:
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "\n\n[TRUNCATED]\n"
+
+
+def md_escape(s: str) -> str:
+    # Minimal escaping to avoid accidental markdown formatting explosions
+    return s.replace("\r", "").strip()
+
+
+def run_ollama(model: str, prompt: str, timeout_s: int = 300) -> str:
     payload = {
         "model": model,
         "prompt": prompt,
@@ -62,7 +75,7 @@ def run_ollama(model: str, prompt: str) -> str:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             body = resp.read().decode("utf-8", errors="ignore")
             data = json.loads(body)
             return data.get("response", "").strip()
@@ -77,15 +90,20 @@ def safe_json_loads(s: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         return None, str(e)
 
 
-def truncate(s: str, limit: int) -> str:
-    if len(s) <= limit:
-        return s
-    return s[:limit] + "\n\n[TRUNCATED]\n"
+def cap_list(x: Any, max_items: int) -> List[Any]:
+    if not isinstance(x, list):
+        return []
+    return x[:max_items]
 
 
-def md_escape(s: str) -> str:
-    # Minimal escaping to avoid accidental markdown formatting explosions
-    return s.replace("\r", "").strip()
+def cap_issues(x: Any, max_items: int) -> List[Dict[str, Any]]:
+    if not isinstance(x, list):
+        return []
+    out = []
+    for it in x[:max_items]:
+        if isinstance(it, dict):
+            out.append(it)
+    return out
 
 
 # --- Agent definitions ---
@@ -127,24 +145,51 @@ AGENTS: List[Agent] = [
     ),
 ]
 
-# JSON schema agent must output
+
+# JSON schema for each agent (strict + short)
 JSON_SCHEMA = """
-Return ONLY valid JSON. No markdown. No explanations. No extra keys. No trailing comments.
-Any output outside JSON is considered a failure.
+Return ONLY valid JSON. No markdown. No explanations. No extra keys.
 
 Schema:
 {
-  "summary": "string (1-3 sentences)",
+  "summary": "string (max 2 sentences)",
   "blocking": [{"issue":"string","evidence":"string","fix":"string"}],
   "non_blocking": [{"issue":"string","evidence":"string","fix":"string"}],
   "tests_to_add": ["string"],
   "questions": ["string"]
 }
 
+Hard limits:
+- blocking: max 2 items
+- non_blocking: max 3 items
+- tests_to_add: max 6 items
+- questions: max 5 items
+
 Rules:
 - Use only the provided DIFF and GUIDELINES.
 - Do not guess. If uncertain, put it into "questions" and set evidence to "unknown".
 - Keep evidence concrete (file/line hints if visible in diff).
+""".strip()
+
+
+CURATOR_SCHEMA = """
+Return ONLY valid JSON. No markdown. No explanations. No extra keys.
+
+Schema:
+{
+  "short_summary": ["string (max 3 bullets)"],
+  "top_actions": ["string (max 5 items)"],
+  "resolved": ["string (max 5 items)"],
+  "still_open": ["string (max 5 items)"],
+  "new_risks": ["string (max 5 items)"]
+}
+
+Rules:
+- Deduplicate and prioritize.
+- Prefer concrete, actionable items.
+- If evidence is weak/unknown, downgrade or omit it.
+- If mode is INITIAL: resolved/still_open can be empty.
+- If mode is FOLLOW_UP: classify items as resolved/still_open/new_risks when possible.
 """.strip()
 
 
@@ -157,7 +202,7 @@ FOLLOW-UP CONTEXT:
 - Previous reviewed HEAD SHA was: {prev_sha}
 - Current HEAD SHA is: {head_sha}
 - The DIFF is expected to contain ONLY changes since the previous review.
-- Focus on verifying whether prior likely issues are addressed, and whether new issues were introduced.
+- Focus on what changed, what got resolved, and what new issues were introduced.
 """.strip()
 
     return f"""
@@ -181,7 +226,34 @@ OUTPUT INSTRUCTIONS:
 """.strip()
 
 
-# --- Markdown report building ---
+def build_curator_prompt(
+        mode: str,
+        prev_sha: str,
+        head_sha: str,
+        agent_json: List[Dict[str, Any]],
+        prev_review_text: str,
+) -> str:
+    payload = {
+        "mode": mode,
+        "previous_reviewed_sha": prev_sha or None,
+        "current_sha": head_sha,
+        "agent_reviews": agent_json,
+        "previous_review_text": truncate(prev_review_text, MAX_PREV_REVIEW_CHARS) if prev_review_text else "",
+    }
+
+    return f"""
+SYSTEM:
+You are a lead reviewer (staff+). Merge multiple agent reviews into a short, actionable PR comment.
+
+INPUT (JSON):
+{json.dumps(payload, ensure_ascii=False)}
+
+OUTPUT INSTRUCTIONS:
+{CURATOR_SCHEMA}
+""".strip()
+
+
+# --- Markdown building ---
 
 def fmt_issue_list(title: str, issues: List[Dict[str, Any]]) -> str:
     if not issues:
@@ -204,9 +276,16 @@ def fmt_list(title: str, items: List[str]) -> str:
     return out + "\n"
 
 
+def fmt_bullets(items: List[str]) -> str:
+    if not items:
+        return "- None\n"
+    return "".join([f"- {md_escape(str(x))}\n" for x in items])
+
+
 def main() -> None:
     diff = read_text(DIFF_PATH)
     guidelines = read_text(GUIDELINES_PATH)
+    prev_review_text = read_text(PREV_REVIEW_PATH)
 
     if not diff.strip():
         OUT_MD.write_text("### Local Multi-Agent AI Review\n\nNo diff found.\n", encoding="utf-8")
@@ -217,31 +296,60 @@ def main() -> None:
     head_sha = get_head_sha()
     mode = "FOLLOW_UP" if PREV_SHA else "INITIAL"
 
+    # Run specialist agents
     results: List[Tuple[Agent, Optional[Dict[str, Any]], Optional[str], str]] = []
-    # tuple: (agent, json, json_error, raw)
+    agent_payloads: List[Dict[str, Any]] = []
 
     for agent in AGENTS:
-        prompt = build_prompt(
-            agent=agent,
-            guidelines=guidelines,
-            diff=diff,
-            mode=mode,
-            prev_sha=PREV_SHA,
-            head_sha=head_sha,
-        )
+        prompt = build_prompt(agent, guidelines, diff, mode, PREV_SHA, head_sha)
         raw = run_ollama(MODEL, prompt)
         data, err = safe_json_loads(raw)
+
+        # Normalize & cap to keep things tight even if model violates limits
+        if data:
+            data["summary"] = str(data.get("summary", ""))[:500]
+            data["blocking"] = cap_issues(data.get("blocking"), 2)
+            data["non_blocking"] = cap_issues(data.get("non_blocking"), 3)
+            data["tests_to_add"] = cap_list(data.get("tests_to_add"), 6)
+            data["questions"] = cap_list(data.get("questions"), 5)
+
+            agent_payloads.append({
+                "agent": agent.name,
+                "summary": data.get("summary", ""),
+                "blocking": data.get("blocking", []),
+                "non_blocking": data.get("non_blocking", []),
+                "tests_to_add": data.get("tests_to_add", []),
+                "questions": data.get("questions", []),
+            })
+
         results.append((agent, data, err, raw))
 
-    # Build consolidated markdown
-    title = "Local Multi-Agent AI Review"
-    if mode == "FOLLOW_UP":
-        title += " (Follow-up)"
+    # Curator step
+    curator_prompt = build_curator_prompt(mode, PREV_SHA, head_sha, agent_payloads, prev_review_text)
+    curator_raw = run_ollama(CURATOR_MODEL, curator_prompt)
+    curator, curator_err = safe_json_loads(curator_raw)
+
+    if curator:
+        curator["short_summary"] = cap_list(curator.get("short_summary"), 3)
+        curator["top_actions"] = cap_list(curator.get("top_actions"), 5)
+        curator["resolved"] = cap_list(curator.get("resolved"), 5)
+        curator["still_open"] = cap_list(curator.get("still_open"), 5)
+        curator["new_risks"] = cap_list(curator.get("new_risks"), 5)
     else:
-        title += " (Initial)"
+        curator = {
+            "short_summary": [f"⚠️ Curator returned invalid JSON: {curator_err}"],
+            "top_actions": [],
+            "resolved": [],
+            "still_open": [],
+            "new_risks": [],
+        }
+
+    # Build markdown
+    title = "Local Multi-Agent AI Review"
+    title += " (Follow-up)" if mode == "FOLLOW_UP" else " (Initial)"
 
     md = f"### {title}\n\n"
-    md += f"Model: `{MODEL}`\n\n"
+    md += f"Models: specialists=`{MODEL}`, curator=`{CURATOR_MODEL}`\n\n"
     md += f"Current HEAD: `{head_sha}`\n"
     if PREV_SHA:
         md += f"Previous reviewed HEAD: `{PREV_SHA}`\n"
@@ -250,7 +358,25 @@ def main() -> None:
     if guidelines.strip():
         md += "_Project guidelines were provided._\n\n"
 
-    # High-level rollup
+    md += "## Curated summary\n\n"
+    md += fmt_bullets(curator.get("short_summary", [])) + "\n"
+
+    md += "### Top actions\n\n"
+    md += fmt_bullets(curator.get("top_actions", [])) + "\n"
+
+    if mode == "FOLLOW_UP":
+        md += "### Resolved\n\n"
+        md += fmt_bullets(curator.get("resolved", [])) + "\n"
+
+        md += "### Still open\n\n"
+        md += fmt_bullets(curator.get("still_open", [])) + "\n"
+
+        md += "### New risks\n\n"
+        md += fmt_bullets(curator.get("new_risks", [])) + "\n"
+
+    # Keep details collapsible to reduce noise in PR
+    md += "<details>\n<summary>Agent details</summary>\n\n"
+
     md += "## Rollup\n\n"
     rollup_lines = []
     for agent, data, err, raw in results:
@@ -261,7 +387,6 @@ def main() -> None:
             rollup_lines.append(f"- **{agent.name}:** ⚠️ invalid JSON output ({err})")
     md += "\n".join(rollup_lines) + "\n\n"
 
-    # Detailed sections
     for agent, data, err, raw in results:
         md += f"---\n\n## {agent.name}\n\n"
         if not data:
@@ -277,9 +402,16 @@ def main() -> None:
         md += fmt_list("Tests to add", data.get("tests_to_add", []) or [])
         md += fmt_list("Questions", data.get("questions", []) or [])
 
-    # Marker for next run to pick up
-    md += "\n---\n\n"
-    md += f"<!-- AI_REVIEW:HEAD_SHA={head_sha} -->"
+    # Curator raw (optional debug)
+    md += "\n---\n\n## Curator (debug)\n\n"
+    if curator_raw:
+        md += "```json\n" + truncate(curator_raw, 3000) + "\n```\n"
+
+    md += "\n</details>\n\n"
+
+    # Stable marker for next run to pick up
+    md += "---\n\n"
+    md += f"<!-- AI_REVIEW:HEAD_SHA={head_sha} -->\n"
 
     OUT_MD.write_text(md, encoding="utf-8")
 
