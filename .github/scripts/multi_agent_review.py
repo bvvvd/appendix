@@ -19,7 +19,9 @@ MAX_PREV_REVIEW_CHARS = int(os.environ.get("MAX_PREV_REVIEW_CHARS", "12000"))
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 PREV_SHA = (os.environ.get("PREV_SHA") or "").strip()
 PREV_REVIEW_PATH = Path(os.environ.get("PREV_REVIEW_PATH", "prev_review.txt"))  # optional
+
 SHOW_DEBUG = (os.environ.get("SHOW_DEBUG") or "").lower() in ("1", "true", "yes")
+SHOW_AGENT_TESTS_QUESTIONS = (os.environ.get("SHOW_AGENT_TESTS_QUESTIONS") or "").lower() in ("1", "true", "yes")
 
 
 # --- Utilities ---
@@ -106,9 +108,7 @@ def cap_issues(x: Any, max_items: int) -> List[Dict[str, Any]]:
 
 def extract_changed_files(diff: str) -> List[str]:
     """
-    Parse `git diff` output and extract changed file paths. We use these paths to:
-    - constrain model references
-    - filter hallucinated evidence
+    Parse `git diff` output and extract changed file paths.
     """
     files: List[str] = []
     for line in diff.splitlines():
@@ -129,9 +129,19 @@ def extract_changed_files(diff: str) -> List[str]:
     return out
 
 
+def filter_allowed_files(files: List[str]) -> List[str]:
+    """
+    To prevent models from "reviewing guidelines" instead of code,
+    drop docs/ by default. If PR changes ONLY docs, allow them.
+    """
+    dropped_prefixes = ("docs/",)
+    filtered = [f for f in files if not f.startswith(dropped_prefixes)]
+    return filtered if filtered else files
+
+
 def drop_weak_issues(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Remove issues with weak evidence. This is critical to reduce hallucinations.
+    Remove issues with weak evidence. Critical to reduce hallucinations.
     """
     out: List[Dict[str, Any]] = []
     for it in issues:
@@ -144,7 +154,7 @@ def drop_weak_issues(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def drop_issues_not_in_files(issues: List[Dict[str, Any]], allowed_files: List[str]) -> List[Dict[str, Any]]:
     """
-    If evidence doesn't mention any changed file, the model likely hallucinated the reference.
+    If evidence doesn't mention any allowed file, the model likely hallucinated.
     Drop it.
     """
     if not allowed_files:
@@ -157,6 +167,15 @@ def drop_issues_not_in_files(issues: List[Dict[str, Any]], allowed_files: List[s
         if any(f in ev for f in allowed_lower):
             out.append(it)
     return out
+
+
+def must_mention_file(line: str, allowed_files: List[str]) -> bool:
+    """
+    Helper for debugging curator output quality:
+    check whether a bullet mentions any allowed file.
+    """
+    s = (line or "").lower()
+    return any(f.lower() in s for f in allowed_files)
 
 
 # --- Agent definitions ---
@@ -172,28 +191,32 @@ AGENTS: List[Agent] = [
         name="Correctness & Reliability",
         focus=(
             "Find correctness risks: idempotency, retries/backoff, timeouts, transactional boundaries, "
-            "race conditions, partial failures, error handling, and data consistency."
+            "race conditions, partial failures, error handling, and data consistency. "
+            "Focus ONLY on code/workflow changes in ALLOWED_FILES."
         ),
     ),
     Agent(
         name="Architecture & Boundaries",
         focus=(
             "Review architecture: module boundaries, coupling, layering, dependency direction, "
-            "API contracts, naming of abstractions, and maintainability trade-offs."
+            "API contracts, naming of abstractions, and maintainability trade-offs. "
+            "Focus ONLY on code/workflow changes in ALLOWED_FILES."
         ),
     ),
     Agent(
         name="Tests & Observability",
         focus=(
             "Suggest tests and observability: unit/integration tests worth adding, edge cases, "
-            "logging/metrics/tracing, and how to reproduce failures."
+            "logging/metrics/tracing, and how to reproduce failures. "
+            "Do NOT review the guideline document itself; review only ALLOWED_FILES changes."
         ),
     ),
     Agent(
         name="Cost & LLM Discipline",
         focus=(
             "Look for cost/perf traps: unnecessary LLM calls, large payloads, missing caching, "
-            "missing state+delta pattern, and risk of GPU contention."
+            "missing state+delta pattern, and risk of GPU contention. "
+            "Focus ONLY on the actual automation code/workflow changes in ALLOWED_FILES."
         ),
     ),
 ]
@@ -219,8 +242,7 @@ Hard limits:
 
 Rules:
 - Use only the provided DIFF and GUIDELINES.
-- Do not guess. If uncertain, put it into "questions" and set evidence to "unknown".
-- Keep evidence concrete (file/line hints if visible in diff).
+- You may ONLY reference file paths from ALLOWED_FILES.
 - If you cannot cite evidence from the DIFF, set evidence to "unknown" AND prefer putting it into "questions" instead of issues.
 """.strip()
 
@@ -237,11 +259,11 @@ Schema:
   "new_risks": ["string (max 5 items)"]
 }
 
-Rules:
+Hard rules:
 - Deduplicate and prioritize.
-- Prefer concrete, actionable items.
-- Each bullet/action should cite at least one file from `changed_files` OR be framed as a question.
-- If evidence is weak/unknown, downgrade or omit it.
+- Each short_summary/top_actions item MUST mention at least one file from `allowed_files` by name.
+  If you cannot tie it to a file, write it as a question (still mention a file that it relates to).
+- If evidence is weak/unknown, omit it.
 - If mode is INITIAL: resolved/still_open can be empty.
 - If mode is FOLLOW_UP: classify items as resolved/still_open/new_risks when possible.
 """.strip()
@@ -302,13 +324,13 @@ def build_curator_prompt(
         head_sha: str,
         agent_json: List[Dict[str, Any]],
         prev_review_text: str,
-        changed_files: List[str],
+        allowed_files: List[str],
 ) -> str:
     payload = {
         "mode": mode,
         "previous_reviewed_sha": prev_sha or None,
         "current_sha": head_sha,
-        "changed_files": changed_files,
+        "allowed_files": allowed_files,
         "agent_reviews": agent_json,
         "previous_review_text": truncate(prev_review_text, MAX_PREV_REVIEW_CHARS) if prev_review_text else "",
     }
@@ -364,7 +386,9 @@ def main() -> None:
         return
 
     diff = truncate(diff, MAX_DIFF_CHARS)
+
     changed_files = extract_changed_files(diff)
+    allowed_files = filter_allowed_files(changed_files)
 
     head_sha = get_head_sha()
     mode = "FOLLOW_UP" if PREV_SHA else "INITIAL"
@@ -374,7 +398,7 @@ def main() -> None:
     agent_payloads: List[Dict[str, Any]] = []
 
     for agent in AGENTS:
-        prompt = build_prompt(agent, guidelines, diff, mode, PREV_SHA, head_sha, changed_files)
+        prompt = build_prompt(agent, guidelines, diff, mode, PREV_SHA, head_sha, allowed_files)
         raw = run_ollama(MODEL, prompt)
         data, err = safe_json_loads(raw)
 
@@ -383,11 +407,11 @@ def main() -> None:
 
             blocking = drop_issues_not_in_files(
                 drop_weak_issues(cap_issues(data.get("blocking"), 2)),
-                changed_files
+                allowed_files,
             )
             non_blocking = drop_issues_not_in_files(
                 drop_weak_issues(cap_issues(data.get("non_blocking"), 3)),
-                changed_files
+                allowed_files,
             )
 
             data["blocking"] = blocking
@@ -413,7 +437,7 @@ def main() -> None:
         head_sha=head_sha,
         agent_json=agent_payloads,
         prev_review_text=prev_review_text,
-        changed_files=changed_files,
+        allowed_files=allowed_files,
     )
     curator_raw = run_ollama(CURATOR_MODEL, curator_prompt)
     curator, curator_err = safe_json_loads(curator_raw)
@@ -432,6 +456,13 @@ def main() -> None:
             "still_open": [],
             "new_risks": [],
         }
+
+    # Optional: basic sanity check for curator outputs (debug only)
+    if SHOW_DEBUG and allowed_files:
+        for section in ("short_summary", "top_actions"):
+            for item in curator.get(section, []) or []:
+                if not must_mention_file(str(item), allowed_files):
+                    print(f"[DEBUG] Curator {section} item missing file mention: {item}")
 
     # Build markdown
     title = "Local Multi-Agent AI Review"
@@ -463,7 +494,6 @@ def main() -> None:
         md += "## New risks\n\n"
         md += fmt_bullets(curator.get("new_risks", [])) + "\n"
 
-    # Details
     md += "<details>\n<summary>Agent details</summary>\n\n"
 
     md += "## Rollup\n\n"
@@ -488,8 +518,10 @@ def main() -> None:
         md += f"**Summary:** {md_escape(str(data.get('summary', '')))}\n\n"
         md += fmt_issue_list("Blocking", data.get("blocking", []) or [])
         md += fmt_issue_list("Non-blocking", data.get("non_blocking", []) or [])
-        md += fmt_list("Tests to add", data.get("tests_to_add", []) or [])
-        md += fmt_list("Questions", data.get("questions", []) or [])
+
+        if SHOW_AGENT_TESTS_QUESTIONS:
+            md += fmt_list("Tests to add", data.get("tests_to_add", []) or [])
+            md += fmt_list("Questions", data.get("questions", []) or [])
 
     if SHOW_DEBUG:
         md += "\n---\n\n## Curator (debug)\n\n"
