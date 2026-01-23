@@ -23,6 +23,9 @@ PREV_REVIEW_PATH = Path(os.environ.get("PREV_REVIEW_PATH", "prev_review.txt"))  
 SHOW_DEBUG = (os.environ.get("SHOW_DEBUG") or "").lower() in ("1", "true", "yes")
 SHOW_AGENT_TESTS_QUESTIONS = (os.environ.get("SHOW_AGENT_TESTS_QUESTIONS") or "").lower() in ("1", "true", "yes")
 
+# Retry agent call once if we fail to parse JSON (common with local models)
+RETRY_ON_BAD_JSON = (os.environ.get("RETRY_ON_BAD_JSON") or "").lower() in ("1", "true", "yes")
+
 
 # --- Utilities ---
 
@@ -83,9 +86,49 @@ def run_ollama(model: str, prompt: str, timeout_s: int = 300) -> str:
         raise RuntimeError(f"Ollama HTTP call failed: {e}")
 
 
+def extract_first_json_object(s: str) -> Optional[str]:
+    """
+    Extract the first top-level JSON object from a string.
+    Handles cases where the model wraps JSON in markdown fences or appends extra text.
+    """
+    if not s:
+        return None
+
+    stripped = s.strip()
+
+    # Strip a leading markdown fence if present
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        # drop first fence line (``` or ```json)
+        lines = lines[1:]
+        # drop last fence line if present
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+
+    start = stripped.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    for i in range(start, len(stripped)):
+        ch = stripped[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return stripped[start:i + 1]
+
+    return None
+
+
 def safe_json_loads(s: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
-        return json.loads(s), None
+        js = extract_first_json_object(s)
+        if not js:
+            return None, "No JSON object found"
+        return json.loads(js), None
     except Exception as e:
         return None, str(e)
 
@@ -170,10 +213,6 @@ def drop_issues_not_in_files(issues: List[Dict[str, Any]], allowed_files: List[s
 
 
 def must_mention_file(line: str, allowed_files: List[str]) -> bool:
-    """
-    Helper for debugging curator output quality:
-    check whether a bullet mentions any allowed file.
-    """
     s = (line or "").lower()
     return any(f.lower() in s for f in allowed_files)
 
@@ -263,6 +302,7 @@ Hard rules:
 - Deduplicate and prioritize.
 - Each short_summary/top_actions item MUST mention at least one file from `allowed_files` by name.
   If you cannot tie it to a file, write it as a question (still mention a file that it relates to).
+- Do NOT recommend changing guidelines unless `docs/review_guidelines.md` is in allowed_files.
 - If evidence is weak/unknown, omit it.
 - If mode is INITIAL: resolved/still_open can be empty.
 - If mode is FOLLOW_UP: classify items as resolved/still_open/new_risks when possible.
@@ -376,6 +416,28 @@ def fmt_bullets(items: List[str]) -> str:
     return "".join([f"- {md_escape(str(x))}\n" for x in items])
 
 
+def call_agent_with_optional_retry(model: str, prompt: str) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Returns: (raw, parsed_json_or_none, err_or_none)
+    If RETRY_ON_BAD_JSON is enabled, retries once with a stricter reminder.
+    """
+    raw = run_ollama(model, prompt)
+    data, err = safe_json_loads(raw)
+    if data is not None:
+        return raw, data, None
+
+    if not RETRY_ON_BAD_JSON:
+        return raw, None, err
+
+    # retry once with a strict reminder (helps local models a lot)
+    retry_prompt = prompt + "\n\nREMINDER: OUTPUT ONLY VALID JSON. NO MARKDOWN. NO EXTRA TEXT."
+    raw2 = run_ollama(model, retry_prompt)
+    data2, err2 = safe_json_loads(raw2)
+    if data2 is not None:
+        return raw2, data2, None
+    return raw2, None, err2
+
+
 def main() -> None:
     diff = read_text(DIFF_PATH)
     guidelines = read_text(GUIDELINES_PATH)
@@ -399,8 +461,7 @@ def main() -> None:
 
     for agent in AGENTS:
         prompt = build_prompt(agent, guidelines, diff, mode, PREV_SHA, head_sha, allowed_files)
-        raw = run_ollama(MODEL, prompt)
-        data, err = safe_json_loads(raw)
+        raw, data, err = call_agent_with_optional_retry(MODEL, prompt)
 
         if data:
             data["summary"] = str(data.get("summary", ""))[:500]
@@ -439,8 +500,7 @@ def main() -> None:
         prev_review_text=prev_review_text,
         allowed_files=allowed_files,
     )
-    curator_raw = run_ollama(CURATOR_MODEL, curator_prompt)
-    curator, curator_err = safe_json_loads(curator_raw)
+    curator_raw, curator, curator_err = call_agent_with_optional_retry(CURATOR_MODEL, curator_prompt)
 
     if curator:
         curator["short_summary"] = cap_list(curator.get("short_summary"), 2)
@@ -457,8 +517,8 @@ def main() -> None:
             "new_risks": [],
         }
 
-    # Optional: basic sanity check for curator outputs (debug only)
-    if SHOW_DEBUG and allowed_files:
+    # Optional sanity check (debug only)
+    if SHOW_DEBUG and allowed_files and curator and isinstance(curator, dict):
         for section in ("short_summary", "top_actions"):
             for item in curator.get(section, []) or []:
                 if not must_mention_file(str(item), allowed_files):
@@ -525,7 +585,7 @@ def main() -> None:
 
     if SHOW_DEBUG:
         md += "\n---\n\n## Curator (debug)\n\n"
-        md += "```json\n" + truncate(curator_raw, 3000) + "\n```\n"
+        md += "```text\n" + truncate(curator_raw, 3000) + "\n```\n"
 
     md += "\n</details>\n\n"
 
