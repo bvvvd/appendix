@@ -62,7 +62,7 @@ def run_ollama(model: str, prompt: str, timeout_s: int = 300) -> str:
         "model": model,
         "prompt": prompt,
         "stream": False,
-        # "keep_alive": 0,  # uncomment if you want to unload model after each call
+        # "keep_alive": 0,  # uncomment to unload model after each call
     }
 
     req = urllib.request.Request(
@@ -104,6 +104,31 @@ def cap_issues(x: Any, max_items: int) -> List[Dict[str, Any]]:
     return out
 
 
+def extract_changed_files(diff: str) -> List[str]:
+    """
+    Parse `git diff` output and extract changed file paths. We use these paths to:
+    - constrain model references
+    - filter hallucinated evidence
+    """
+    files: List[str] = []
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            parts = line.split()
+            if len(parts) >= 4:
+                b = parts[3]  # b/...
+                if b.startswith("b/"):
+                    files.append(b[2:])
+
+    # dedupe, keep order
+    seen = set()
+    out: List[str] = []
+    for f in files:
+        if f not in seen:
+            out.append(f)
+            seen.add(f)
+    return out
+
+
 def drop_weak_issues(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Remove issues with weak evidence. This is critical to reduce hallucinations.
@@ -114,6 +139,23 @@ def drop_weak_issues(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not ev or ev == "unknown":
             continue
         out.append(it)
+    return out
+
+
+def drop_issues_not_in_files(issues: List[Dict[str, Any]], allowed_files: List[str]) -> List[Dict[str, Any]]:
+    """
+    If evidence doesn't mention any changed file, the model likely hallucinated the reference.
+    Drop it.
+    """
+    if not allowed_files:
+        return issues
+
+    allowed_lower = [f.lower() for f in allowed_files]
+    out: List[Dict[str, Any]] = []
+    for it in issues:
+        ev = str(it.get("evidence", "")).lower()
+        if any(f in ev for f in allowed_lower):
+            out.append(it)
     return out
 
 
@@ -198,13 +240,22 @@ Schema:
 Rules:
 - Deduplicate and prioritize.
 - Prefer concrete, actionable items.
+- Each bullet/action should cite at least one file from `changed_files` OR be framed as a question.
 - If evidence is weak/unknown, downgrade or omit it.
 - If mode is INITIAL: resolved/still_open can be empty.
 - If mode is FOLLOW_UP: classify items as resolved/still_open/new_risks when possible.
 """.strip()
 
 
-def build_prompt(agent: Agent, guidelines: str, diff: str, mode: str, prev_sha: str, head_sha: str) -> str:
+def build_prompt(
+        agent: Agent,
+        guidelines: str,
+        diff: str,
+        mode: str,
+        prev_sha: str,
+        head_sha: str,
+        allowed_files: List[str],
+) -> str:
     followup_hint = ""
     if mode == "FOLLOW_UP":
         followup_hint = f"""
@@ -215,12 +266,21 @@ FOLLOW-UP CONTEXT:
 - Focus on what changed, what got resolved, and what new issues were introduced.
 """.strip()
 
+    allowed_files_text = "\n".join(allowed_files) if allowed_files else "(none)"
+
     return f"""
 SYSTEM:
 You are a strict senior/staff+ software engineer acting as a pull request reviewer.
 
 MODE: {mode}
 {followup_hint}
+
+ALLOWED_FILES (critical):
+{allowed_files_text}
+
+Critical rules:
+- You may ONLY reference file paths from ALLOWED_FILES.
+- If you cannot point to evidence in the DIFF, DO NOT create an issue. Put it into "questions".
 
 TASK:
 {agent.focus}
@@ -242,11 +302,13 @@ def build_curator_prompt(
         head_sha: str,
         agent_json: List[Dict[str, Any]],
         prev_review_text: str,
+        changed_files: List[str],
 ) -> str:
     payload = {
         "mode": mode,
         "previous_reviewed_sha": prev_sha or None,
         "current_sha": head_sha,
+        "changed_files": changed_files,
         "agent_reviews": agent_json,
         "previous_review_text": truncate(prev_review_text, MAX_PREV_REVIEW_CHARS) if prev_review_text else "",
     }
@@ -302,6 +364,7 @@ def main() -> None:
         return
 
     diff = truncate(diff, MAX_DIFF_CHARS)
+    changed_files = extract_changed_files(diff)
 
     head_sha = get_head_sha()
     mode = "FOLLOW_UP" if PREV_SHA else "INITIAL"
@@ -311,15 +374,21 @@ def main() -> None:
     agent_payloads: List[Dict[str, Any]] = []
 
     for agent in AGENTS:
-        prompt = build_prompt(agent, guidelines, diff, mode, PREV_SHA, head_sha)
+        prompt = build_prompt(agent, guidelines, diff, mode, PREV_SHA, head_sha, changed_files)
         raw = run_ollama(MODEL, prompt)
         data, err = safe_json_loads(raw)
 
         if data:
             data["summary"] = str(data.get("summary", ""))[:500]
 
-            blocking = drop_weak_issues(cap_issues(data.get("blocking"), 2))
-            non_blocking = drop_weak_issues(cap_issues(data.get("non_blocking"), 3))
+            blocking = drop_issues_not_in_files(
+                drop_weak_issues(cap_issues(data.get("blocking"), 2)),
+                changed_files
+            )
+            non_blocking = drop_issues_not_in_files(
+                drop_weak_issues(cap_issues(data.get("non_blocking"), 3)),
+                changed_files
+            )
 
             data["blocking"] = blocking
             data["non_blocking"] = non_blocking
@@ -338,7 +407,14 @@ def main() -> None:
         results.append((agent, data, err, raw))
 
     # Curator step
-    curator_prompt = build_curator_prompt(mode, PREV_SHA, head_sha, agent_payloads, prev_review_text)
+    curator_prompt = build_curator_prompt(
+        mode=mode,
+        prev_sha=PREV_SHA,
+        head_sha=head_sha,
+        agent_json=agent_payloads,
+        prev_review_text=prev_review_text,
+        changed_files=changed_files,
+    )
     curator_raw = run_ollama(CURATOR_MODEL, curator_prompt)
     curator, curator_err = safe_json_loads(curator_raw)
 
