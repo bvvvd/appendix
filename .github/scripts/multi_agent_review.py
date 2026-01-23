@@ -22,8 +22,6 @@ PREV_REVIEW_PATH = Path(os.environ.get("PREV_REVIEW_PATH", "prev_review.txt"))  
 
 SHOW_DEBUG = (os.environ.get("SHOW_DEBUG") or "").lower() in ("1", "true", "yes")
 SHOW_AGENT_TESTS_QUESTIONS = (os.environ.get("SHOW_AGENT_TESTS_QUESTIONS") or "").lower() in ("1", "true", "yes")
-
-# Retry agent call once if we fail to parse JSON (common with local models)
 RETRY_ON_BAD_JSON = (os.environ.get("RETRY_ON_BAD_JSON") or "").lower() in ("1", "true", "yes")
 
 
@@ -99,9 +97,7 @@ def extract_first_json_object(s: str) -> Optional[str]:
     # Strip a leading markdown fence if present
     if stripped.startswith("```"):
         lines = stripped.splitlines()
-        # drop first fence line (``` or ```json)
-        lines = lines[1:]
-        # drop last fence line if present
+        lines = lines[1:]  # drop first fence line
         if lines and lines[-1].strip().startswith("```"):
             lines = lines[:-1]
         stripped = "\n".join(lines).strip()
@@ -184,7 +180,7 @@ def filter_allowed_files(files: List[str]) -> List[str]:
 
 def drop_weak_issues(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Remove issues with weak evidence. Critical to reduce hallucinations.
+    Remove issues with weak evidence.
     """
     out: List[Dict[str, Any]] = []
     for it in issues:
@@ -198,7 +194,6 @@ def drop_weak_issues(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def drop_issues_not_in_files(issues: List[Dict[str, Any]], allowed_files: List[str]) -> List[Dict[str, Any]]:
     """
     If evidence doesn't mention any allowed file, the model likely hallucinated.
-    Drop it.
     """
     if not allowed_files:
         return issues
@@ -215,6 +210,17 @@ def drop_issues_not_in_files(issues: List[Dict[str, Any]], allowed_files: List[s
 def must_mention_file(line: str, allowed_files: List[str]) -> bool:
     s = (line or "").lower()
     return any(f.lower() in s for f in allowed_files)
+
+
+def diff_facts(diff: str, allowed_files: List[str], max_lines: int = 60) -> str:
+    """
+    Provide a minimal "facts" header to reduce model drift:
+    - list changed files
+    - show first N lines of diff
+    """
+    files = "\n".join(allowed_files) if allowed_files else "(none)"
+    head = "\n".join(diff.splitlines()[:max_lines])
+    return f"CHANGED_FILES:\n{files}\n\nDIFF_HEAD (first {max_lines} lines):\n{head}"
 
 
 # --- Agent definitions ---
@@ -279,10 +285,12 @@ Hard limits:
 - tests_to_add: max 6 items
 - questions: max 5 items
 
-Rules:
-- Use only the provided DIFF and GUIDELINES.
+Hard rules (facts):
+- You MUST NOT mention technologies, files, functions, or problems that are not present in DIFF.
+- If DIFF does not show Kotlin/coroutines/external calls/etc, do NOT mention them.
+- GUIDELINES are for evaluation only; DIFF is the ONLY source of facts.
 - You may ONLY reference file paths from ALLOWED_FILES.
-- If you cannot cite evidence from the DIFF, set evidence to "unknown" AND prefer putting it into "questions" instead of issues.
+- If you cannot cite evidence from the DIFF, set evidence to "unknown" AND prefer putting it into "questions".
 """.strip()
 
 
@@ -301,11 +309,10 @@ Schema:
 Hard rules:
 - Deduplicate and prioritize.
 - Each short_summary/top_actions item MUST mention at least one file from `allowed_files` by name.
-  If you cannot tie it to a file, write it as a question (still mention a file that it relates to).
+  If you cannot tie it to a file, write it as a question (still mention a related file).
 - Do NOT recommend changing guidelines unless `docs/review_guidelines.md` is in allowed_files.
-- If evidence is weak/unknown, omit it.
-- If mode is INITIAL: resolved/still_open can be empty.
-- If mode is FOLLOW_UP: classify items as resolved/still_open/new_risks when possible.
+- Do NOT output "mega lists" of test categories. Each action should be a single concrete thing.
+- Use DIFF as the only source of facts; do not invent Kotlin/coroutines/etc.
 """.strip()
 
 
@@ -330,6 +337,8 @@ FOLLOW-UP CONTEXT:
 
     allowed_files_text = "\n".join(allowed_files) if allowed_files else "(none)"
 
+    facts = diff_facts(diff, allowed_files, max_lines=60)
+
     return f"""
 SYSTEM:
 You are a strict senior/staff+ software engineer acting as a pull request reviewer.
@@ -340,14 +349,18 @@ MODE: {mode}
 ALLOWED_FILES (critical):
 {allowed_files_text}
 
+FACTS_FROM_DIFF (use for factual claims):
+{facts}
+
 Critical rules:
+- DIFF is the ONLY source of facts. GUIDELINES are only for judging what you see in DIFF.
 - You may ONLY reference file paths from ALLOWED_FILES.
-- If you cannot point to evidence in the DIFF, DO NOT create an issue. Put it into "questions".
+- You MUST NOT mention technologies/files not present in DIFF. If not shown, don't say it.
 
 TASK:
 {agent.focus}
 
-GUIDELINES:
+GUIDELINES (evaluation only):
 {guidelines if guidelines else "(none provided)"}
 
 DIFF:
@@ -365,6 +378,7 @@ def build_curator_prompt(
         agent_json: List[Dict[str, Any]],
         prev_review_text: str,
         allowed_files: List[str],
+        diff: str,
 ) -> str:
     payload = {
         "mode": mode,
@@ -373,6 +387,7 @@ def build_curator_prompt(
         "allowed_files": allowed_files,
         "agent_reviews": agent_json,
         "previous_review_text": truncate(prev_review_text, MAX_PREV_REVIEW_CHARS) if prev_review_text else "",
+        "facts_from_diff": diff_facts(diff, allowed_files, max_lines=60),
     }
 
     return f"""
@@ -385,6 +400,23 @@ INPUT (JSON):
 OUTPUT INSTRUCTIONS:
 {CURATOR_SCHEMA}
 """.strip()
+
+
+def call_with_optional_retry(model: str, prompt: str) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+    raw = run_ollama(model, prompt)
+    data, err = safe_json_loads(raw)
+    if data is not None:
+        return raw, data, None
+
+    if not RETRY_ON_BAD_JSON:
+        return raw, None, err
+
+    retry_prompt = prompt + "\n\nREMINDER: OUTPUT ONLY VALID JSON. NO MARKDOWN. NO EXTRA TEXT."
+    raw2 = run_ollama(model, retry_prompt)
+    data2, err2 = safe_json_loads(raw2)
+    if data2 is not None:
+        return raw2, data2, None
+    return raw2, None, err2
 
 
 # --- Markdown building ---
@@ -416,28 +448,6 @@ def fmt_bullets(items: List[str]) -> str:
     return "".join([f"- {md_escape(str(x))}\n" for x in items])
 
 
-def call_agent_with_optional_retry(model: str, prompt: str) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Returns: (raw, parsed_json_or_none, err_or_none)
-    If RETRY_ON_BAD_JSON is enabled, retries once with a stricter reminder.
-    """
-    raw = run_ollama(model, prompt)
-    data, err = safe_json_loads(raw)
-    if data is not None:
-        return raw, data, None
-
-    if not RETRY_ON_BAD_JSON:
-        return raw, None, err
-
-    # retry once with a strict reminder (helps local models a lot)
-    retry_prompt = prompt + "\n\nREMINDER: OUTPUT ONLY VALID JSON. NO MARKDOWN. NO EXTRA TEXT."
-    raw2 = run_ollama(model, retry_prompt)
-    data2, err2 = safe_json_loads(raw2)
-    if data2 is not None:
-        return raw2, data2, None
-    return raw2, None, err2
-
-
 def main() -> None:
     diff = read_text(DIFF_PATH)
     guidelines = read_text(GUIDELINES_PATH)
@@ -455,13 +465,12 @@ def main() -> None:
     head_sha = get_head_sha()
     mode = "FOLLOW_UP" if PREV_SHA else "INITIAL"
 
-    # Run specialist agents
     results: List[Tuple[Agent, Optional[Dict[str, Any]], Optional[str], str]] = []
     agent_payloads: List[Dict[str, Any]] = []
 
     for agent in AGENTS:
         prompt = build_prompt(agent, guidelines, diff, mode, PREV_SHA, head_sha, allowed_files)
-        raw, data, err = call_agent_with_optional_retry(MODEL, prompt)
+        raw, data, err = call_with_optional_retry(MODEL, prompt)
 
         if data:
             data["summary"] = str(data.get("summary", ""))[:500]
@@ -491,7 +500,6 @@ def main() -> None:
 
         results.append((agent, data, err, raw))
 
-    # Curator step
     curator_prompt = build_curator_prompt(
         mode=mode,
         prev_sha=PREV_SHA,
@@ -499,8 +507,9 @@ def main() -> None:
         agent_json=agent_payloads,
         prev_review_text=prev_review_text,
         allowed_files=allowed_files,
+        diff=diff,
     )
-    curator_raw, curator, curator_err = call_agent_with_optional_retry(CURATOR_MODEL, curator_prompt)
+    curator_raw, curator, curator_err = call_with_optional_retry(CURATOR_MODEL, curator_prompt)
 
     if curator:
         curator["short_summary"] = cap_list(curator.get("short_summary"), 2)
@@ -517,14 +526,12 @@ def main() -> None:
             "new_risks": [],
         }
 
-    # Optional sanity check (debug only)
     if SHOW_DEBUG and allowed_files and curator and isinstance(curator, dict):
         for section in ("short_summary", "top_actions"):
             for item in curator.get(section, []) or []:
                 if not must_mention_file(str(item), allowed_files):
                     print(f"[DEBUG] Curator {section} item missing file mention: {item}")
 
-    # Build markdown
     title = "Local Multi-Agent AI Review"
     title += " (Follow-up)" if mode == "FOLLOW_UP" else " (Initial)"
 
@@ -589,7 +596,6 @@ def main() -> None:
 
     md += "\n</details>\n\n"
 
-    # Stable marker for next run
     md += "---\n\n"
     md += f"<!-- AI_REVIEW:HEAD_SHA={head_sha} -->\n"
 
