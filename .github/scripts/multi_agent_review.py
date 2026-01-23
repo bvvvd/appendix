@@ -87,6 +87,19 @@ def run_ollama(model: str, prompt: str, timeout_s: int = 300) -> str:
         raise RuntimeError(f"Ollama HTTP call failed: {e}")
 
 
+def sanitize_jsonish(s: str) -> str:
+    """
+    Normalize common model output issues:
+    - smart quotes -> ascii quotes
+    - odd apostrophes -> ascii apostrophes
+    """
+    if not s:
+        return s
+    s = s.replace("“", '"').replace("”", '"').replace("„", '"')
+    s = s.replace("’", "'").replace("‘", "'")
+    return s
+
+
 def extract_first_json_object(s: str) -> Optional[str]:
     if not s:
         return None
@@ -120,9 +133,11 @@ def extract_first_json_object(s: str) -> Optional[str]:
 
 def safe_json_loads(s: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
+        s = sanitize_jsonish(s)
         js = extract_first_json_object(s)
         if not js:
             return None, "No JSON object found"
+        js = sanitize_jsonish(js)
         return json.loads(js), None
     except Exception as e:
         return None, str(e)
@@ -199,7 +214,7 @@ def must_mention_file(line: str, allowed_files: List[str]) -> bool:
 
 def mentions_only_allowed_files(line: str, allowed_files: List[str]) -> bool:
     """
-    Conservative: if line mentions a '.py' / '.yml' / '.yaml' / '.kt' / '.java' / '.md' path,
+    Conservative: if line mentions a path with a known extension,
     ensure every mentioned path is within allowed_files.
     """
     import re
@@ -233,7 +248,6 @@ def diff_contains_any(diff_lower: str, needles: List[str]) -> bool:
 def gate_claims_to_diff(text: str, diff_lower: str) -> bool:
     """
     If the text talks about a gated topic, require the diff to contain related lexemes.
-    This is intentionally strict to avoid hallucinated "idempotence/retry/etc" claims.
     """
     t = (text or "").lower()
     for topic, needles in KEYWORD_GATES.items():
@@ -247,7 +261,7 @@ def filter_bullets_by_fact_gate(items: List[str], diff_lower: str, allowed_files
     out: List[str] = []
     for x in items:
         s = str(x)
-        if not must_mention_file(s, allowed_files):
+        if allowed_files and not must_mention_file(s, allowed_files):
             continue
         if not mentions_only_allowed_files(s, allowed_files):
             continue
@@ -257,14 +271,58 @@ def filter_bullets_by_fact_gate(items: List[str], diff_lower: str, allowed_files
     return out
 
 
-def rewrite_agent_summary_if_vague(summary: str, diff_lower: str) -> str:
+def agent_summary_ok(summary: str, diff_lower: str, allowed_files: List[str]) -> bool:
+    s = (summary or "").strip()
+    if not s:
+        return False
+    if STRICT_FACT_GATING and not gate_claims_to_diff(s, diff_lower):
+        return False
+    if allowed_files and not must_mention_file(s, allowed_files):
+        return False
+    if not mentions_only_allowed_files(s, allowed_files):
+        return False
+    return True
+
+
+def rewrite_agent_summary_if_vague(summary: str, diff_lower: str, allowed_files: List[str]) -> str:
     s = (summary or "").strip()
     if not s:
         return s
-    if STRICT_FACT_GATING and not gate_claims_to_diff(s, diff_lower):
-        # neutral fallback
+    if not agent_summary_ok(s, diff_lower, allowed_files):
         return "No concrete issues were identified from the DIFF."
     return s
+
+
+def extract_relevant_guidelines(guidelines: str, diff: str, max_lines: int = 80) -> str:
+    """
+    Reduce guideline "prompt bleed" by only including relevant snippets.
+    - If diff doesn't trigger any keywords, include only a tiny header (first ~20 lines).
+    - Otherwise, include up to max_lines lines that match triggered keywords.
+    """
+    if not guidelines.strip():
+        return ""
+    diff_lower = diff.lower()
+    triggers: List[str] = []
+    for needles in KEYWORD_GATES.values():
+        for n in needles:
+            if n in diff_lower:
+                triggers.append(n)
+    triggers = list(dict.fromkeys(triggers))
+
+    lines = guidelines.splitlines()
+
+    if not triggers:
+        return "\n".join(lines[:min(len(lines), 20)])
+
+    picked: List[str] = []
+    for ln in lines:
+        l = ln.lower()
+        if any(k in l for k in triggers):
+            picked.append(ln)
+            if len(picked) >= max_lines:
+                break
+
+    return "\n".join(picked) if picked else "\n".join(lines[:min(len(lines), 20)])
 
 
 # --- Agent definitions ---
@@ -380,6 +438,7 @@ FOLLOW-UP CONTEXT:
 
     allowed_files_text = "\n".join(allowed_files) if allowed_files else "(none)"
     facts = diff_facts(diff, allowed_files, max_lines=60)
+    relevant_guidelines = extract_relevant_guidelines(guidelines, diff)
 
     return f"""
 SYSTEM:
@@ -402,8 +461,8 @@ Critical rules:
 TASK:
 {agent.focus}
 
-GUIDELINES (evaluation only):
-{guidelines if guidelines else "(none provided)"}
+GUIDELINES (evaluation only, trimmed):
+{relevant_guidelines if relevant_guidelines else "(none provided)"}
 
 DIFF:
 {diff}
@@ -516,8 +575,7 @@ def main() -> None:
         raw, data, err = call_with_optional_retry(MODEL, prompt)
 
         if data:
-            # Summary gating to reduce generic claims
-            data["summary"] = rewrite_agent_summary_if_vague(str(data.get("summary", ""))[:500], diff_lower)
+            data["summary"] = rewrite_agent_summary_if_vague(str(data.get("summary", ""))[:500], diff_lower, allowed_files)
 
             blocking = drop_issues_not_in_files(
                 drop_weak_issues(cap_issues(data.get("blocking"), 2)),
@@ -562,7 +620,6 @@ def main() -> None:
         curator["still_open"] = cap_list(curator.get("still_open"), 5)
         curator["new_risks"] = cap_list(curator.get("new_risks"), 5)
 
-        # Fact-gate curator bullets/actions
         curator["short_summary"] = filter_bullets_by_fact_gate(curator["short_summary"], diff_lower, allowed_files)[:2]
         curator["top_actions"] = filter_bullets_by_fact_gate(curator["top_actions"], diff_lower, allowed_files)[:3]
 
@@ -570,12 +627,7 @@ def main() -> None:
             curator["resolved"] = filter_bullets_by_fact_gate(curator["resolved"], diff_lower, allowed_files)[:5]
             curator["still_open"] = filter_bullets_by_fact_gate(curator["still_open"], diff_lower, allowed_files)[:5]
             curator["new_risks"] = filter_bullets_by_fact_gate(curator["new_risks"], diff_lower, allowed_files)[:5]
-        else:
-            curator["resolved"] = cap_list(curator.get("resolved"), 5)
-            curator["still_open"] = cap_list(curator.get("still_open"), 5)
-            curator["new_risks"] = cap_list(curator.get("new_risks"), 5)
 
-        # If gating nuked everything, keep a minimal, honest summary.
         if not curator["short_summary"]:
             if allowed_files:
                 curator["short_summary"] = [f"Changed: {', '.join(allowed_files[:3])}" + (" ..." if len(allowed_files) > 3 else "")]
