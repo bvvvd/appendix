@@ -24,6 +24,9 @@ SHOW_DEBUG = (os.environ.get("SHOW_DEBUG") or "").lower() in ("1", "true", "yes"
 SHOW_AGENT_TESTS_QUESTIONS = (os.environ.get("SHOW_AGENT_TESTS_QUESTIONS") or "").lower() in ("1", "true", "yes")
 RETRY_ON_BAD_JSON = (os.environ.get("RETRY_ON_BAD_JSON") or "").lower() in ("1", "true", "yes")
 
+# Optional: aggressively prune vague summaries/top_actions
+STRICT_FACT_GATING = (os.environ.get("STRICT_FACT_GATING") or "").lower() in ("1", "true", "yes")
+
 
 # --- Utilities ---
 
@@ -85,10 +88,6 @@ def run_ollama(model: str, prompt: str, timeout_s: int = 300) -> str:
 
 
 def extract_first_json_object(s: str) -> Optional[str]:
-    """
-    Extract the first top-level JSON object from a string.
-    Handles cases where the model wraps JSON in markdown fences or appends extra text.
-    """
     if not s:
         return None
 
@@ -146,9 +145,6 @@ def cap_issues(x: Any, max_items: int) -> List[Dict[str, Any]]:
 
 
 def extract_changed_files(diff: str) -> List[str]:
-    """
-    Parse `git diff` output and extract changed file paths.
-    """
     files: List[str] = []
     for line in diff.splitlines():
         if line.startswith("diff --git "):
@@ -158,7 +154,6 @@ def extract_changed_files(diff: str) -> List[str]:
                 if b.startswith("b/"):
                     files.append(b[2:])
 
-    # dedupe, keep order
     seen = set()
     out: List[str] = []
     for f in files:
@@ -169,19 +164,12 @@ def extract_changed_files(diff: str) -> List[str]:
 
 
 def filter_allowed_files(files: List[str]) -> List[str]:
-    """
-    To prevent models from "reviewing guidelines" instead of code,
-    drop docs/ by default. If PR changes ONLY docs, allow them.
-    """
     dropped_prefixes = ("docs/",)
     filtered = [f for f in files if not f.startswith(dropped_prefixes)]
     return filtered if filtered else files
 
 
 def drop_weak_issues(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Remove issues with weak evidence.
-    """
     out: List[Dict[str, Any]] = []
     for it in issues:
         ev = str(it.get("evidence", "")).strip().lower()
@@ -192,9 +180,6 @@ def drop_weak_issues(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def drop_issues_not_in_files(issues: List[Dict[str, Any]], allowed_files: List[str]) -> List[Dict[str, Any]]:
-    """
-    If evidence doesn't mention any allowed file, the model likely hallucinated.
-    """
     if not allowed_files:
         return issues
 
@@ -212,15 +197,74 @@ def must_mention_file(line: str, allowed_files: List[str]) -> bool:
     return any(f.lower() in s for f in allowed_files)
 
 
+def mentions_only_allowed_files(line: str, allowed_files: List[str]) -> bool:
+    """
+    Conservative: if line mentions a '.py' / '.yml' / '.yaml' / '.kt' / '.java' / '.md' path,
+    ensure every mentioned path is within allowed_files.
+    """
+    import re
+    paths = re.findall(r"[\w./-]+\.(?:py|yml|yaml|kt|java|md)", line or "")
+    if not paths:
+        return True
+    allowed_set = set(allowed_files)
+    return all(p in allowed_set for p in paths)
+
+
 def diff_facts(diff: str, allowed_files: List[str], max_lines: int = 60) -> str:
-    """
-    Provide a minimal "facts" header to reduce model drift:
-    - list changed files
-    - show first N lines of diff
-    """
     files = "\n".join(allowed_files) if allowed_files else "(none)"
     head = "\n".join(diff.splitlines()[:max_lines])
     return f"CHANGED_FILES:\n{files}\n\nDIFF_HEAD (first {max_lines} lines):\n{head}"
+
+
+# --- Fact gating (reduce "smart generic" talk) ---
+
+KEYWORD_GATES: Dict[str, List[str]] = {
+    "idempot": ["idempot", "dedup", "at-least-once", "exactly-once"],
+    "retry": ["retry", "backoff", "exponential"],
+    "timeout": ["timeout", "time out", "deadline"],
+    "logging": ["logger", "log.", "logging", "trace", "span", "metric"],
+    "external": ["http", "request", "client", "api", "url", "fetch"],
+    "concurrency": ["mutex", "lock", "synchronized", "race", "concurrent", "coroutine", "thread"],
+}
+
+def diff_contains_any(diff_lower: str, needles: List[str]) -> bool:
+    return any(n in diff_lower for n in needles)
+
+def gate_claims_to_diff(text: str, diff_lower: str) -> bool:
+    """
+    If the text talks about a gated topic, require the diff to contain related lexemes.
+    This is intentionally strict to avoid hallucinated "idempotence/retry/etc" claims.
+    """
+    t = (text or "").lower()
+    for topic, needles in KEYWORD_GATES.items():
+        if topic in t or any(n in t for n in needles):
+            if not diff_contains_any(diff_lower, needles):
+                return False
+    return True
+
+
+def filter_bullets_by_fact_gate(items: List[str], diff_lower: str, allowed_files: List[str]) -> List[str]:
+    out: List[str] = []
+    for x in items:
+        s = str(x)
+        if not must_mention_file(s, allowed_files):
+            continue
+        if not mentions_only_allowed_files(s, allowed_files):
+            continue
+        if STRICT_FACT_GATING and not gate_claims_to_diff(s, diff_lower):
+            continue
+        out.append(s)
+    return out
+
+
+def rewrite_agent_summary_if_vague(summary: str, diff_lower: str) -> str:
+    s = (summary or "").strip()
+    if not s:
+        return s
+    if STRICT_FACT_GATING and not gate_claims_to_diff(s, diff_lower):
+        # neutral fallback
+        return "No concrete issues were identified from the DIFF."
+    return s
 
 
 # --- Agent definitions ---
@@ -286,9 +330,8 @@ Hard limits:
 - questions: max 5 items
 
 Hard rules (facts):
-- You MUST NOT mention technologies, files, functions, or problems that are not present in DIFF.
-- If DIFF does not show Kotlin/coroutines/external calls/etc, do NOT mention them.
-- GUIDELINES are for evaluation only; DIFF is the ONLY source of facts.
+- DIFF is the ONLY source of facts. GUIDELINES are for evaluation only.
+- You MUST NOT mention technologies/files/functions/problems not present in DIFF.
 - You may ONLY reference file paths from ALLOWED_FILES.
 - If you cannot cite evidence from the DIFF, set evidence to "unknown" AND prefer putting it into "questions".
 """.strip()
@@ -307,12 +350,12 @@ Schema:
 }
 
 Hard rules:
-- Deduplicate and prioritize.
+- DIFF is the ONLY source of facts.
+- You MUST NOT mention any file not present in `allowed_files`.
 - Each short_summary/top_actions item MUST mention at least one file from `allowed_files` by name.
-  If you cannot tie it to a file, write it as a question (still mention a related file).
 - Do NOT recommend changing guidelines unless `docs/review_guidelines.md` is in allowed_files.
-- Do NOT output "mega lists" of test categories. Each action should be a single concrete thing.
-- Use DIFF as the only source of facts; do not invent Kotlin/coroutines/etc.
+- Do NOT output mega lists of test categories; each action must be one concrete thing.
+- Prefer "Changed: <files> ..." style over generic claims.
 """.strip()
 
 
@@ -336,7 +379,6 @@ FOLLOW-UP CONTEXT:
 """.strip()
 
     allowed_files_text = "\n".join(allowed_files) if allowed_files else "(none)"
-
     facts = diff_facts(diff, allowed_files, max_lines=60)
 
     return f"""
@@ -353,9 +395,9 @@ FACTS_FROM_DIFF (use for factual claims):
 {facts}
 
 Critical rules:
-- DIFF is the ONLY source of facts. GUIDELINES are only for judging what you see in DIFF.
+- DIFF is the ONLY source of facts. GUIDELINES are for judging what you see in DIFF.
 - You may ONLY reference file paths from ALLOWED_FILES.
-- You MUST NOT mention technologies/files not present in DIFF. If not shown, don't say it.
+- You MUST NOT mention technologies/files not present in DIFF.
 
 TASK:
 {agent.focus}
@@ -458,6 +500,7 @@ def main() -> None:
         return
 
     diff = truncate(diff, MAX_DIFF_CHARS)
+    diff_lower = diff.lower()
 
     changed_files = extract_changed_files(diff)
     allowed_files = filter_allowed_files(changed_files)
@@ -473,7 +516,8 @@ def main() -> None:
         raw, data, err = call_with_optional_retry(MODEL, prompt)
 
         if data:
-            data["summary"] = str(data.get("summary", ""))[:500]
+            # Summary gating to reduce generic claims
+            data["summary"] = rewrite_agent_summary_if_vague(str(data.get("summary", ""))[:500], diff_lower)
 
             blocking = drop_issues_not_in_files(
                 drop_weak_issues(cap_issues(data.get("blocking"), 2)),
@@ -517,6 +561,30 @@ def main() -> None:
         curator["resolved"] = cap_list(curator.get("resolved"), 5)
         curator["still_open"] = cap_list(curator.get("still_open"), 5)
         curator["new_risks"] = cap_list(curator.get("new_risks"), 5)
+
+        # Fact-gate curator bullets/actions
+        curator["short_summary"] = filter_bullets_by_fact_gate(curator["short_summary"], diff_lower, allowed_files)[:2]
+        curator["top_actions"] = filter_bullets_by_fact_gate(curator["top_actions"], diff_lower, allowed_files)[:3]
+
+        if mode == "FOLLOW_UP":
+            curator["resolved"] = filter_bullets_by_fact_gate(curator["resolved"], diff_lower, allowed_files)[:5]
+            curator["still_open"] = filter_bullets_by_fact_gate(curator["still_open"], diff_lower, allowed_files)[:5]
+            curator["new_risks"] = filter_bullets_by_fact_gate(curator["new_risks"], diff_lower, allowed_files)[:5]
+        else:
+            curator["resolved"] = cap_list(curator.get("resolved"), 5)
+            curator["still_open"] = cap_list(curator.get("still_open"), 5)
+            curator["new_risks"] = cap_list(curator.get("new_risks"), 5)
+
+        # If gating nuked everything, keep a minimal, honest summary.
+        if not curator["short_summary"]:
+            if allowed_files:
+                curator["short_summary"] = [f"Changed: {', '.join(allowed_files[:3])}" + (" ..." if len(allowed_files) > 3 else "")]
+            else:
+                curator["short_summary"] = ["No concrete issues were identified from the DIFF."]
+
+        if not curator["top_actions"]:
+            curator["top_actions"] = ["No high-priority actions identified from the DIFF."]
+
     else:
         curator = {
             "short_summary": [f"⚠️ Curator returned invalid JSON: {curator_err}"],
@@ -530,7 +598,9 @@ def main() -> None:
         for section in ("short_summary", "top_actions"):
             for item in curator.get(section, []) or []:
                 if not must_mention_file(str(item), allowed_files):
-                    print(f"[DEBUG] Curator {section} item missing file mention: {item}")
+                    print(f"[DEBUG] Curator {section} item missing allowed file mention: {item}")
+                if not mentions_only_allowed_files(str(item), allowed_files):
+                    print(f"[DEBUG] Curator {section} item mentions non-allowed file(s): {item}")
 
     title = "Local Multi-Agent AI Review"
     title += " (Follow-up)" if mode == "FOLLOW_UP" else " (Initial)"
