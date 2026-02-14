@@ -13,7 +13,9 @@ repositories {
 dependencies {
     implementation("com.zaxxer:HikariCP:7.0.2")
     implementation("org.postgresql:postgresql:42.7.9")
-    // This dependency is used internally, and not exposed to consumers on their own compile classpath.
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.17.1")
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.17.1")
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jdk8:2.17.1")
     implementation("com.google.guava:guava:32.1.3-jre")
     testImplementation("org.junit.jupiter:junit-jupiter:5.9.2")
     testImplementation("org.assertj:assertj-core:3.24.2")
