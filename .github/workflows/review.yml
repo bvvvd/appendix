@@ -67,18 +67,36 @@ jobs:
         env:
           MODEL: qwen2.5:14b-instruct
           MAX_DIFF_CHARS: "80000"
+          RETRY_ON_BAD_JSON: "1"
+          # Set SHOW_DEBUG=1 to see detailed debug output in PR comment
+          # SHOW_DEBUG: "1"
         run: |
-          python .github/scripts/multi_agent_review.py
+          python .github/scripts/multi_agent_review.py 2>&1
+          if (-not (Test-Path review_comment.md)) {
+            Write-Error "review_comment.md was not created - script may have failed silently"
+            exit 1
+          }
+          Write-Host "Review comment generated successfully"
 
       - name: Post comment to PR
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if (-not (Test-Path review_comment.md)) {
+            Write-Error "review_comment.md does not exist - cannot post comment"
+            exit 1
+          }
+          
           $pr = "${{ github.event.pull_request.number }}"
           # Try to edit last comment; if it fails, create a new one.
           gh pr comment $pr --edit-last --body-file review_comment.md
           if ($LASTEXITCODE -ne 0) {
             Write-Host "Edit-last failed, creating a new comment."
             gh pr comment $pr --body-file review_comment.md
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "Failed to post comment to PR"
+              exit 1
+            }
           }
+          Write-Host "Comment posted successfully"
