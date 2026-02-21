@@ -348,8 +348,8 @@ def rewrite_agent_summary_if_vague(summary: str, diff_lower: str, allowed_files:
     if not s:
         return "Reviewed changes but found no specific issues to report."
     
-    # Only rewrite if STRICT_FACT_GATING is enabled
-    if STRICT_FACT_GATING and not agent_summary_ok(s, diff_lower, allowed_files):
+    # Always rewrite when summary fails validation (file constraints; fact-gating only when STRICT_FACT_GATING)
+    if not agent_summary_ok(s, diff_lower, allowed_files):
         if allowed_files:
             return f"Reviewed changes in {', '.join(allowed_files[:2])}{'...' if len(allowed_files) > 2 else ''}."
         return "Reviewed changes but found no specific issues to report."
