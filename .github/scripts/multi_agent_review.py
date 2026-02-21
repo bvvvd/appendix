@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,10 +23,14 @@ PREV_REVIEW_PATH = Path(os.environ.get("PREV_REVIEW_PATH", "prev_review.txt"))  
 
 SHOW_DEBUG = (os.environ.get("SHOW_DEBUG") or "").lower() in ("1", "true", "yes")
 SHOW_AGENT_TESTS_QUESTIONS = (os.environ.get("SHOW_AGENT_TESTS_QUESTIONS") or "").lower() in ("1", "true", "yes")
-RETRY_ON_BAD_JSON = (os.environ.get("RETRY_ON_BAD_JSON") or "").lower() in ("1", "true", "yes")
+RETRY_ON_BAD_JSON = (os.environ.get("RETRY_ON_BAD_JSON") or "1").lower() in ("1", "true", "yes")  # Default to True
 
 # Optional: aggressively prune vague summaries/top_actions
 STRICT_FACT_GATING = (os.environ.get("STRICT_FACT_GATING") or "").lower() in ("1", "true", "yes")
+
+def log(msg: str) -> None:
+    """Print to stderr for debugging."""
+    print(f"[REVIEW] {msg}", file=sys.stderr)
 
 
 # --- Utilities ---
@@ -82,7 +87,14 @@ def run_ollama(model: str, prompt: str, timeout_s: int = 300) -> str:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             body = resp.read().decode("utf-8", errors="ignore")
             data = json.loads(body)
-            return data.get("response", "").strip()
+            response = data.get("response", "").strip()
+            if not response:
+                log(f"Warning: Empty response from Ollama model {model}")
+            return response
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Ollama connection failed (is Ollama running at {OLLAMA_URL}?): {e}")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Ollama returned invalid JSON: {e}")
     except Exception as e:
         raise RuntimeError(f"Ollama HTTP call failed: {e}")
 
@@ -109,11 +121,20 @@ def extract_first_json_object(s: str) -> Optional[str]:
     # Strip a leading markdown fence if present
     if stripped.startswith("```"):
         lines = stripped.splitlines()
-        lines = lines[1:]  # drop first fence line
+        if lines:
+            # Check for language identifier (json, jsonl, etc.)
+            first_line = lines[0].lower()
+            if "json" in first_line or first_line.strip() == "```":
+                lines = lines[1:]  # drop first fence line
+            else:
+                # Not a JSON code block, might be text
+                pass
+        
         if lines and lines[-1].strip().startswith("```"):
             lines = lines[:-1]
         stripped = "\n".join(lines).strip()
 
+    # Try to find JSON object
     start = stripped.find("{")
     if start == -1:
         return None
@@ -132,15 +153,27 @@ def extract_first_json_object(s: str) -> Optional[str]:
 
 
 def safe_json_loads(s: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if not s or not s.strip():
+        return None, "Empty response"
+    
     try:
         s = sanitize_jsonish(s)
         js = extract_first_json_object(s)
         if not js:
-            return None, "No JSON object found"
+            # Try parsing the whole string as JSON (maybe it's already clean)
+            try:
+                return json.loads(s.strip()), None
+            except:
+                return None, "No JSON object found in response"
         js = sanitize_jsonish(js)
-        return json.loads(js), None
+        parsed = json.loads(js)
+        if not isinstance(parsed, dict):
+            return None, f"JSON is not an object (got {type(parsed).__name__})"
+        return parsed, None
+    except json.JSONDecodeError as e:
+        return None, f"JSON decode error: {str(e)[:200]}"
     except Exception as e:
-        return None, str(e)
+        return None, str(e)[:200]
 
 
 def cap_list(x: Any, max_items: int) -> List[Any]:
@@ -260,14 +293,37 @@ def gate_claims_to_diff(text: str, diff_lower: str) -> bool:
 def filter_bullets_by_fact_gate(items: List[str], diff_lower: str, allowed_files: List[str]) -> List[str]:
     out: List[str] = []
     for x in items:
-        s = str(x)
-        if allowed_files and not must_mention_file(s, allowed_files):
+        s = str(x).strip()
+        if not s:
             continue
-        if not mentions_only_allowed_files(s, allowed_files):
-            continue
+        
+        # If no allowed files, skip file-based filtering
+        if allowed_files:
+            # Relaxed: allow items that mention files OR are general enough
+            if not must_mention_file(s, allowed_files):
+                # Still allow if it doesn't mention any specific files (general advice)
+                if mentions_only_allowed_files(s, allowed_files):
+                    # It mentions files but they're not in allowed_files - skip
+                    continue
+            elif not mentions_only_allowed_files(s, allowed_files):
+                # Mentions allowed file but also non-allowed files - skip
+                continue
+        
+        # Fact gating only applies if STRICT_FACT_GATING is enabled
         if STRICT_FACT_GATING and not gate_claims_to_diff(s, diff_lower):
             continue
+        
         out.append(s)
+    
+    # If everything was filtered but we have items, return at least one
+    if not out and items:
+        # Return the first item that's not empty, even if it doesn't pass all filters
+        for x in items:
+            s = str(x).strip()
+            if s:
+                out.append(s)
+                break
+    
     return out
 
 
@@ -287,9 +343,13 @@ def agent_summary_ok(summary: str, diff_lower: str, allowed_files: List[str]) ->
 def rewrite_agent_summary_if_vague(summary: str, diff_lower: str, allowed_files: List[str]) -> str:
     s = (summary or "").strip()
     if not s:
-        return s
-    if not agent_summary_ok(s, diff_lower, allowed_files):
-        return "No concrete issues were identified from the DIFF."
+        return "Reviewed changes but found no specific issues to report."
+    
+    # Only rewrite if STRICT_FACT_GATING is enabled
+    if STRICT_FACT_GATING and not agent_summary_ok(s, diff_lower, allowed_files):
+        if allowed_files:
+            return f"Reviewed changes in {', '.join(allowed_files[:2])}{'...' if len(allowed_files) > 2 else ''}."
+        return "Reviewed changes but found no specific issues to report."
     return s
 
 
@@ -370,35 +430,40 @@ AGENTS: List[Agent] = [
 
 
 JSON_SCHEMA = """
-Return ONLY valid JSON. No markdown. No explanations. No extra keys.
+You MUST return valid JSON only. Start with { and end with }. No markdown code fences, no explanations before or after.
 
-Schema:
+Required JSON schema:
 {
-  "summary": "string (max 2 sentences)",
+  "summary": "string (1-2 sentences describing your review findings)",
   "blocking": [{"issue":"string","evidence":"string","fix":"string"}],
   "non_blocking": [{"issue":"string","evidence":"string","fix":"string"}],
   "tests_to_add": ["string"],
   "questions": ["string"]
 }
 
-Hard limits:
-- blocking: max 2 items
-- non_blocking: max 3 items
-- tests_to_add: max 6 items
-- questions: max 5 items
+Limits:
+- blocking: maximum 2 items
+- non_blocking: maximum 3 items  
+- tests_to_add: maximum 6 items
+- questions: maximum 5 items
 
-Hard rules (facts):
-- DIFF is the ONLY source of facts. GUIDELINES are for evaluation only.
-- You MUST NOT mention technologies/files/functions/problems not present in DIFF.
-- You may ONLY reference file paths from ALLOWED_FILES.
-- If you cannot cite evidence from the DIFF, set evidence to "unknown" AND prefer putting it into "questions".
+Rules:
+- DIFF contains the actual code changes. Use it as your primary source.
+- GUIDELINES help you evaluate what you see in the DIFF.
+- Only reference files from ALLOWED_FILES list.
+- If you find no issues, return empty arrays but still provide a summary.
+- Evidence should reference specific lines/files from the DIFF when possible.
+- If evidence is unclear, use "unknown" for evidence field.
+
+Example valid response:
+{"summary":"Reviewed the changes. Found one potential issue with error handling.","blocking":[],"non_blocking":[{"issue":"Missing error handling","evidence":"EventStore.kt line 45","fix":"Add try-catch around database operation"}],"tests_to_add":[],"questions":[]}
 """.strip()
 
 
 CURATOR_SCHEMA = """
-Return ONLY valid JSON. No markdown. No explanations. No extra keys.
+You MUST return valid JSON only. Start with { and end with }. No markdown code fences, no explanations.
 
-Schema:
+Required JSON schema:
 {
   "short_summary": ["string (max 2 bullets)"],
   "top_actions": ["string (max 3 items)"],
@@ -407,13 +472,17 @@ Schema:
   "new_risks": ["string (max 5 items)"]
 }
 
-Hard rules:
-- DIFF is the ONLY source of facts.
-- You MUST NOT mention any file not present in `allowed_files`.
-- Each short_summary/top_actions item MUST mention at least one file from `allowed_files` by name.
-- Do NOT recommend changing guidelines unless `docs/review_guidelines.md` is in allowed_files.
-- Do NOT output mega lists of test categories; each action must be one concrete thing.
-- Prefer "Changed: <files> ..." style over generic claims.
+Rules:
+- DIFF contains the actual code changes.
+- Only mention files from the `allowed_files` array.
+- short_summary should summarize what changed (mention files if possible).
+- top_actions should be concrete, actionable items.
+- If no issues found, still provide a summary like "Changed: <files> - looks good" or "No issues identified".
+- For follow-up reviews, use resolved/still_open/new_risks to track changes.
+- Each item should be specific and actionable, not generic.
+
+Example valid response:
+{"short_summary":["Changed: EventStore.kt - added error handling"],"top_actions":["Verify error handling covers all database operations"],"resolved":[],"still_open":[],"new_risks":[]}
 """.strip()
 
 
@@ -504,20 +573,35 @@ OUTPUT INSTRUCTIONS:
 
 
 def call_with_optional_retry(model: str, prompt: str) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
-    raw = run_ollama(model, prompt)
-    data, err = safe_json_loads(raw)
-    if data is not None:
-        return raw, data, None
+    try:
+        raw = run_ollama(model, prompt)
+        if not raw:
+            return "", None, "Empty response from model"
+        
+        data, err = safe_json_loads(raw)
+        if data is not None:
+            log(f"Successfully parsed JSON from {model}")
+            return raw, data, None
 
-    if not RETRY_ON_BAD_JSON:
-        return raw, None, err
+        log(f"Failed to parse JSON from {model}: {err}")
+        
+        if not RETRY_ON_BAD_JSON:
+            return raw, None, err
 
-    retry_prompt = prompt + "\n\nREMINDER: OUTPUT ONLY VALID JSON. NO MARKDOWN. NO EXTRA TEXT."
-    raw2 = run_ollama(model, retry_prompt)
-    data2, err2 = safe_json_loads(raw2)
-    if data2 is not None:
-        return raw2, data2, None
-    return raw2, None, err2
+        log(f"Retrying {model} with stricter JSON instructions")
+        retry_prompt = prompt + "\n\nCRITICAL: You MUST output ONLY valid JSON. Start with { and end with }. No markdown, no code fences, no explanations. Just the JSON object."
+        raw2 = run_ollama(model, retry_prompt)
+        if not raw2:
+            return raw, None, f"Retry also returned empty response. Original error: {err}"
+        
+        data2, err2 = safe_json_loads(raw2)
+        if data2 is not None:
+            log(f"Successfully parsed JSON on retry from {model}")
+            return raw2, data2, None
+        return raw2, None, f"Retry failed: {err2} (original: {err})"
+    except Exception as e:
+        log(f"Exception calling {model}: {e}")
+        return "", None, str(e)
 
 
 # --- Markdown building ---
@@ -550,178 +634,241 @@ def fmt_bullets(items: List[str]) -> str:
 
 
 def main() -> None:
-    diff = read_text(DIFF_PATH)
-    guidelines = read_text(GUIDELINES_PATH)
-    prev_review_text = read_text(PREV_REVIEW_PATH)
+    try:
+        log("Starting review script")
+        diff = read_text(DIFF_PATH)
+        guidelines = read_text(GUIDELINES_PATH)
+        prev_review_text = read_text(PREV_REVIEW_PATH)
 
-    if not diff.strip():
-        OUT_MD.write_text("### Local Multi-Agent AI Review\n\nNo diff found.\n", encoding="utf-8")
-        return
+        if not diff.strip():
+            log("No diff found")
+            OUT_MD.write_text("### Local Multi-Agent AI Review\n\nNo diff found.\n", encoding="utf-8")
+            return
 
-    diff = truncate(diff, MAX_DIFF_CHARS)
-    diff_lower = diff.lower()
+        log(f"Diff size: {len(diff)} chars")
+        diff = truncate(diff, MAX_DIFF_CHARS)
+        diff_lower = diff.lower()
 
-    changed_files = extract_changed_files(diff)
-    allowed_files = filter_allowed_files(changed_files)
+        changed_files = extract_changed_files(diff)
+        allowed_files = filter_allowed_files(changed_files)
+        log(f"Changed files: {allowed_files}")
 
-    head_sha = get_head_sha()
-    mode = "FOLLOW_UP" if PREV_SHA else "INITIAL"
+        try:
+            head_sha = get_head_sha()
+        except Exception as e:
+            log(f"Warning: Could not get HEAD SHA: {e}")
+            head_sha = "unknown"
+        
+        mode = "FOLLOW_UP" if PREV_SHA else "INITIAL"
+        log(f"Mode: {mode}, Model: {MODEL}, Curator: {CURATOR_MODEL}")
 
-    results: List[Tuple[Agent, Optional[Dict[str, Any]], Optional[str], str]] = []
-    agent_payloads: List[Dict[str, Any]] = []
+        results: List[Tuple[Agent, Optional[Dict[str, Any]], Optional[str], str]] = []
+        agent_payloads: List[Dict[str, Any]] = []
 
-    for agent in AGENTS:
-        prompt = build_prompt(agent, guidelines, diff, mode, PREV_SHA, head_sha, allowed_files)
-        raw, data, err = call_with_optional_retry(MODEL, prompt)
+        for agent in AGENTS:
+            log(f"Calling agent: {agent.name}")
+            try:
+                prompt = build_prompt(agent, guidelines, diff, mode, PREV_SHA, head_sha, allowed_files)
+                raw, data, err = call_with_optional_retry(MODEL, prompt)
 
-        if data:
-            data["summary"] = rewrite_agent_summary_if_vague(str(data.get("summary", ""))[:500], diff_lower, allowed_files)
+                if data:
+                    data["summary"] = rewrite_agent_summary_if_vague(str(data.get("summary", ""))[:500], diff_lower, allowed_files)
 
-            blocking = drop_issues_not_in_files(
-                drop_weak_issues(cap_issues(data.get("blocking"), 2)),
-                allowed_files,
-            )
-            non_blocking = drop_issues_not_in_files(
-                drop_weak_issues(cap_issues(data.get("non_blocking"), 3)),
-                allowed_files,
-            )
+                    blocking = drop_issues_not_in_files(
+                        drop_weak_issues(cap_issues(data.get("blocking"), 2)),
+                        allowed_files,
+                    )
+                    non_blocking = drop_issues_not_in_files(
+                        drop_weak_issues(cap_issues(data.get("non_blocking"), 3)),
+                        allowed_files,
+                    )
 
-            data["blocking"] = blocking
-            data["non_blocking"] = non_blocking
-            data["tests_to_add"] = cap_list(data.get("tests_to_add"), 6)
-            data["questions"] = cap_list(data.get("questions"), 5)
+                    data["blocking"] = blocking
+                    data["non_blocking"] = non_blocking
+                    data["tests_to_add"] = cap_list(data.get("tests_to_add"), 6)
+                    data["questions"] = cap_list(data.get("questions"), 5)
 
-            agent_payloads.append({
-                "agent": agent.name,
-                "summary": data.get("summary", ""),
-                "blocking": blocking,
-                "non_blocking": non_blocking,
-                "tests_to_add": data.get("tests_to_add", []),
-                "questions": data.get("questions", []),
-            })
+                    agent_payloads.append({
+                        "agent": agent.name,
+                        "summary": data.get("summary", ""),
+                        "blocking": blocking,
+                        "non_blocking": non_blocking,
+                        "tests_to_add": data.get("tests_to_add", []),
+                        "questions": data.get("questions", []),
+                    })
+                    log(f"Agent {agent.name} succeeded")
+                else:
+                    log(f"Agent {agent.name} failed: {err}")
+            except Exception as e:
+                log(f"Exception calling agent {agent.name}: {e}")
+                err = str(e)
+                raw = ""
+                data = None
 
-        results.append((agent, data, err, raw))
+            results.append((agent, data, err, raw))
 
-    curator_prompt = build_curator_prompt(
-        mode=mode,
-        prev_sha=PREV_SHA,
-        head_sha=head_sha,
-        agent_json=agent_payloads,
-        prev_review_text=prev_review_text,
-        allowed_files=allowed_files,
-        diff=diff,
-    )
-    curator_raw, curator, curator_err = call_with_optional_retry(CURATOR_MODEL, curator_prompt)
+        # Ensure we have at least some agent data, even if minimal
+        if not agent_payloads:
+            log("Warning: No agents succeeded, creating fallback payload")
+            agent_payloads = [{
+                "agent": "System",
+                "summary": "Review agents encountered errors. See details below.",
+                "blocking": [],
+                "non_blocking": [],
+                "tests_to_add": [],
+                "questions": [],
+            }]
 
-    if curator:
-        curator["short_summary"] = cap_list(curator.get("short_summary"), 2)
-        curator["top_actions"] = cap_list(curator.get("top_actions"), 3)
-        curator["resolved"] = cap_list(curator.get("resolved"), 5)
-        curator["still_open"] = cap_list(curator.get("still_open"), 5)
-        curator["new_risks"] = cap_list(curator.get("new_risks"), 5)
+        log(f"Calling curator with {len(agent_payloads)} agent results")
+        curator_prompt = build_curator_prompt(
+            mode=mode,
+            prev_sha=PREV_SHA,
+            head_sha=head_sha,
+            agent_json=agent_payloads,
+            prev_review_text=prev_review_text,
+            allowed_files=allowed_files,
+            diff=diff,
+        )
+        curator_raw, curator, curator_err = call_with_optional_retry(CURATOR_MODEL, curator_prompt)
 
-        curator["short_summary"] = filter_bullets_by_fact_gate(curator["short_summary"], diff_lower, allowed_files)[:2]
-        curator["top_actions"] = filter_bullets_by_fact_gate(curator["top_actions"], diff_lower, allowed_files)[:3]
+        if curator:
+            curator["short_summary"] = cap_list(curator.get("short_summary"), 2)
+            curator["top_actions"] = cap_list(curator.get("top_actions"), 3)
+            curator["resolved"] = cap_list(curator.get("resolved"), 5)
+            curator["still_open"] = cap_list(curator.get("still_open"), 5)
+            curator["new_risks"] = cap_list(curator.get("new_risks"), 5)
+
+            curator["short_summary"] = filter_bullets_by_fact_gate(curator["short_summary"], diff_lower, allowed_files)[:2]
+            curator["top_actions"] = filter_bullets_by_fact_gate(curator["top_actions"], diff_lower, allowed_files)[:3]
+
+            if mode == "FOLLOW_UP":
+                curator["resolved"] = filter_bullets_by_fact_gate(curator["resolved"], diff_lower, allowed_files)[:5]
+                curator["still_open"] = filter_bullets_by_fact_gate(curator["still_open"], diff_lower, allowed_files)[:5]
+                curator["new_risks"] = filter_bullets_by_fact_gate(curator["new_risks"], diff_lower, allowed_files)[:5]
+
+            # Ensure we always have content
+            if not curator["short_summary"]:
+                if allowed_files:
+                    curator["short_summary"] = [f"Changed: {', '.join(allowed_files[:3])}" + (" ..." if len(allowed_files) > 3 else "")]
+                else:
+                    curator["short_summary"] = ["Reviewed changes - no issues identified."]
+
+            if not curator["top_actions"]:
+                curator["top_actions"] = ["No high-priority actions needed."]
+
+            log("Curator succeeded")
+        else:
+            log(f"Curator failed: {curator_err}")
+            # Create fallback curator output
+            curator = {
+                "short_summary": [f"⚠️ Review system error: {curator_err[:100]}" if curator_err else "Review completed but curator had issues"],
+                "top_actions": ["Check agent details below for review findings"] if agent_payloads else ["Review agents encountered errors"],
+                "resolved": [],
+                "still_open": [],
+                "new_risks": [],
+            }
+
+        if SHOW_DEBUG and allowed_files and curator and isinstance(curator, dict):
+            for section in ("short_summary", "top_actions"):
+                for item in curator.get(section, []) or []:
+                    if not must_mention_file(str(item), allowed_files):
+                        log(f"[DEBUG] Curator {section} item missing allowed file mention: {item}")
+                    if not mentions_only_allowed_files(str(item), allowed_files):
+                        log(f"[DEBUG] Curator {section} item mentions non-allowed file(s): {item}")
+
+        title = "Local Multi-Agent AI Review"
+        title += " (Follow-up)" if mode == "FOLLOW_UP" else " (Initial)"
+
+        md = f"### {title}\n\n"
+        md += f"Models: specialists=`{MODEL}`, curator=`{CURATOR_MODEL}`\n\n"
+        md += f"Current HEAD: `{head_sha}`\n"
+        if PREV_SHA:
+            md += f"Previous reviewed HEAD: `{PREV_SHA}`\n"
+        md += "\n"
+
+        if guidelines.strip():
+            md += "_Project guidelines were provided._\n\n"
+
+        md += "## Curated summary\n\n"
+        md += fmt_bullets(curator.get("short_summary", [])) + "\n"
+
+        md += "## Top actions\n\n"
+        md += fmt_bullets(curator.get("top_actions", [])) + "\n"
 
         if mode == "FOLLOW_UP":
-            curator["resolved"] = filter_bullets_by_fact_gate(curator["resolved"], diff_lower, allowed_files)[:5]
-            curator["still_open"] = filter_bullets_by_fact_gate(curator["still_open"], diff_lower, allowed_files)[:5]
-            curator["new_risks"] = filter_bullets_by_fact_gate(curator["new_risks"], diff_lower, allowed_files)[:5]
+            md += "## Resolved\n\n"
+            md += fmt_bullets(curator.get("resolved", [])) + "\n"
 
-        if not curator["short_summary"]:
-            if allowed_files:
-                curator["short_summary"] = [f"Changed: {', '.join(allowed_files[:3])}" + (" ..." if len(allowed_files) > 3 else "")]
+            md += "## Still open\n\n"
+            md += fmt_bullets(curator.get("still_open", [])) + "\n"
+
+            md += "## New risks\n\n"
+            md += fmt_bullets(curator.get("new_risks", [])) + "\n"
+
+        md += "<details>\n<summary>Agent details</summary>\n\n"
+
+        md += "## Rollup\n\n"
+        rollup_lines = []
+        for agent, data, err, raw in results:
+            if data:
+                s = md_escape(str(data.get("summary", "")))
+                rollup_lines.append(f"- **{agent.name}:** {s}")
             else:
-                curator["short_summary"] = ["No concrete issues were identified from the DIFF."]
+                rollup_lines.append(f"- **{agent.name}:** ⚠️ invalid JSON output ({err})")
+        md += "\n".join(rollup_lines) + "\n\n"
 
-        if not curator["top_actions"]:
-            curator["top_actions"] = ["No high-priority actions identified from the DIFF."]
+        for agent, data, err, raw in results:
+            md += f"---\n\n## {agent.name}\n\n"
+            if not data:
+                md += "**⚠️ Agent returned invalid JSON.**\n\n"
+                md += "Raw output (truncated):\n\n```text\n"
+                md += truncate(raw, 3000)
+                md += "\n```\n\n"
+                continue
 
-    else:
-        curator = {
-            "short_summary": [f"⚠️ Curator returned invalid JSON: {curator_err}"],
-            "top_actions": [],
-            "resolved": [],
-            "still_open": [],
-            "new_risks": [],
-        }
+            md += f"**Summary:** {md_escape(str(data.get('summary', '')))}\n\n"
+            md += fmt_issue_list("Blocking", data.get("blocking", []) or [])
+            md += fmt_issue_list("Non-blocking", data.get("non_blocking", []) or [])
 
-    if SHOW_DEBUG and allowed_files and curator and isinstance(curator, dict):
-        for section in ("short_summary", "top_actions"):
-            for item in curator.get(section, []) or []:
-                if not must_mention_file(str(item), allowed_files):
-                    print(f"[DEBUG] Curator {section} item missing allowed file mention: {item}")
-                if not mentions_only_allowed_files(str(item), allowed_files):
-                    print(f"[DEBUG] Curator {section} item mentions non-allowed file(s): {item}")
+            if SHOW_AGENT_TESTS_QUESTIONS:
+                md += fmt_list("Tests to add", data.get("tests_to_add", []) or [])
+                md += fmt_list("Questions", data.get("questions", []) or [])
 
-    title = "Local Multi-Agent AI Review"
-    title += " (Follow-up)" if mode == "FOLLOW_UP" else " (Initial)"
+        if SHOW_DEBUG:
+            md += "\n---\n\n## Curator (debug)\n\n"
+            md += "```text\n" + truncate(curator_raw, 3000) + "\n```\n"
 
-    md = f"### {title}\n\n"
-    md += f"Models: specialists=`{MODEL}`, curator=`{CURATOR_MODEL}`\n\n"
-    md += f"Current HEAD: `{head_sha}`\n"
-    if PREV_SHA:
-        md += f"Previous reviewed HEAD: `{PREV_SHA}`\n"
-    md += "\n"
+        md += "\n</details>\n\n"
 
-    if guidelines.strip():
-        md += "_Project guidelines were provided._\n\n"
+        md += "---\n\n"
+        md += f"<!-- AI_REVIEW:HEAD_SHA={head_sha} -->\n"
 
-    md += "## Curated summary\n\n"
-    md += fmt_bullets(curator.get("short_summary", [])) + "\n"
+        OUT_MD.write_text(md, encoding="utf-8")
+        log("Review comment written successfully")
+        
+    except Exception as e:
+        log(f"Fatal error in main: {e}")
+        import traceback
+        log(traceback.format_exc())
+        
+        # Write error output so user knows what happened
+        error_md = f"""### Local Multi-Agent AI Review
 
-    md += "## Top actions\n\n"
-    md += fmt_bullets(curator.get("top_actions", [])) + "\n"
+⚠️ **Error:** Review script encountered a fatal error.
 
-    if mode == "FOLLOW_UP":
-        md += "## Resolved\n\n"
-        md += fmt_bullets(curator.get("resolved", [])) + "\n"
+```
+{str(e)[:500]}
+```
 
-        md += "## Still open\n\n"
-        md += fmt_bullets(curator.get("still_open", [])) + "\n"
+Please check:
+1. Is Ollama running at {OLLAMA_URL}?
+2. Is the model `{MODEL}` available?
+3. Check workflow logs for details.
 
-        md += "## New risks\n\n"
-        md += fmt_bullets(curator.get("new_risks", [])) + "\n"
-
-    md += "<details>\n<summary>Agent details</summary>\n\n"
-
-    md += "## Rollup\n\n"
-    rollup_lines = []
-    for agent, data, err, raw in results:
-        if data:
-            s = md_escape(str(data.get("summary", "")))
-            rollup_lines.append(f"- **{agent.name}:** {s}")
-        else:
-            rollup_lines.append(f"- **{agent.name}:** ⚠️ invalid JSON output ({err})")
-    md += "\n".join(rollup_lines) + "\n\n"
-
-    for agent, data, err, raw in results:
-        md += f"---\n\n## {agent.name}\n\n"
-        if not data:
-            md += "**⚠️ Agent returned invalid JSON.**\n\n"
-            md += "Raw output (truncated):\n\n```text\n"
-            md += truncate(raw, 3000)
-            md += "\n```\n\n"
-            continue
-
-        md += f"**Summary:** {md_escape(str(data.get('summary', '')))}\n\n"
-        md += fmt_issue_list("Blocking", data.get("blocking", []) or [])
-        md += fmt_issue_list("Non-blocking", data.get("non_blocking", []) or [])
-
-        if SHOW_AGENT_TESTS_QUESTIONS:
-            md += fmt_list("Tests to add", data.get("tests_to_add", []) or [])
-            md += fmt_list("Questions", data.get("questions", []) or [])
-
-    if SHOW_DEBUG:
-        md += "\n---\n\n## Curator (debug)\n\n"
-        md += "```text\n" + truncate(curator_raw, 3000) + "\n```\n"
-
-    md += "\n</details>\n\n"
-
-    md += "---\n\n"
-    md += f"<!-- AI_REVIEW:HEAD_SHA={head_sha} -->\n"
-
-    OUT_MD.write_text(md, encoding="utf-8")
+<!-- AI_REVIEW:HEAD_SHA=error -->
+"""
+        OUT_MD.write_text(error_md, encoding="utf-8")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
