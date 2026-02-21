@@ -162,8 +162,13 @@ def safe_json_loads(s: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         if not js:
             # Try parsing the whole string as JSON (maybe it's already clean)
             try:
-                return json.loads(s.strip()), None
-            except:
+                parsed = json.loads(s.strip())
+                if not isinstance(parsed, dict):
+                    return None, f"JSON is not an object (got {type(parsed).__name__})"
+                return parsed, None
+            except json.JSONDecodeError:
+                return None, "No JSON object found in response"
+            except Exception:
                 return None, "No JSON object found in response"
         js = sanitize_jsonish(js)
         parsed = json.loads(js)
@@ -299,14 +304,9 @@ def filter_bullets_by_fact_gate(items: List[str], diff_lower: str, allowed_files
         
         # If no allowed files, skip file-based filtering
         if allowed_files:
-            # Relaxed: allow items that mention files OR are general enough
-            if not must_mention_file(s, allowed_files):
-                # Still allow if it doesn't mention any specific files (general advice)
-                if mentions_only_allowed_files(s, allowed_files):
-                    # It mentions files but they're not in allowed_files - skip
-                    continue
-            elif not mentions_only_allowed_files(s, allowed_files):
-                # Mentions allowed file but also non-allowed files - skip
+            # Allow: general advice (no file paths) or items that only mention allowed files.
+            # Skip only when the item mentions at least one path that is not in allowed_files.
+            if not mentions_only_allowed_files(s, allowed_files):
                 continue
         
         # Fact gating only applies if STRICT_FACT_GATING is enabled
@@ -315,14 +315,17 @@ def filter_bullets_by_fact_gate(items: List[str], diff_lower: str, allowed_files
         
         out.append(s)
     
-    # If everything was filtered but we have items, return at least one
+    # If everything was filtered but we have items, return at most one item that
+    # still satisfies file constraints (do not surface content that failed file filtering).
     if not out and items:
-        # Return the first item that's not empty, even if it doesn't pass all filters
         for x in items:
             s = str(x).strip()
-            if s:
-                out.append(s)
-                break
+            if not s:
+                continue
+            if allowed_files and not mentions_only_allowed_files(s, allowed_files):
+                continue
+            out.append(s)
+            break
     
     return out
 
