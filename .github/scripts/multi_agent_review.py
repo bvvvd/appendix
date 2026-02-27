@@ -112,27 +112,34 @@ def sanitize_jsonish(s: str) -> str:
     return s
 
 
+def strip_json_fence(s: str) -> str:
+    if not s:
+        return s
+
+    stripped = s.strip()
+    if not stripped.startswith("```"):
+        return stripped
+
+    lines = stripped.splitlines()
+    if not lines:
+        return stripped
+
+    # Only strip fences when the block is generic or json-like.
+    first_line = lines[0].strip().lower()
+    if first_line != "```" and "json" not in first_line:
+        return stripped
+
+    body = lines[1:]
+    if body and body[-1].strip().startswith("```"):
+        body = body[:-1]
+    return "\n".join(body).strip()
+
+
 def extract_first_json_object(s: str) -> Optional[str]:
     if not s:
         return None
 
-    stripped = s.strip()
-
-    # Strip a leading markdown fence if present
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
-        if lines:
-            # Check for language identifier (json, jsonl, etc.)
-            first_line = lines[0].lower()
-            if "json" in first_line or first_line.strip() == "```":
-                lines = lines[1:]  # drop first fence line
-            else:
-                # Not a JSON code block, might be text
-                pass
-        
-        if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]
-        stripped = "\n".join(lines).strip()
+    stripped = strip_json_fence(s)
 
     # Try to find JSON object
     start = stripped.find("{")
@@ -140,14 +147,33 @@ def extract_first_json_object(s: str) -> Optional[str]:
         return None
 
     depth = 0
+    in_string = False
+    escaped = False
     for i in range(start, len(stripped)):
         ch = stripped[i]
+        if in_string:
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
         if ch == "{":
             depth += 1
-        elif ch == "}":
+            continue
+        if ch == "}":
             depth -= 1
             if depth == 0:
                 return stripped[start:i + 1]
+            if depth < 0:
+                return None
 
     return None
 
@@ -158,18 +184,22 @@ def safe_json_loads(s: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     
     try:
         s = sanitize_jsonish(s)
-        js = extract_first_json_object(s)
+        clean = strip_json_fence(s)
+
+        # Fast path: whole payload is a JSON object.
+        try:
+            parsed = json.loads(clean)
+            if not isinstance(parsed, dict):
+                return None, f"JSON is not an object (got {type(parsed).__name__})"
+            return parsed, None
+        except json.JSONDecodeError:
+            pass
+        except Exception:
+            pass
+
+        js = extract_first_json_object(clean)
         if not js:
-            # Try parsing the whole string as JSON (maybe it's already clean)
-            try:
-                parsed = json.loads(s.strip())
-                if not isinstance(parsed, dict):
-                    return None, f"JSON is not an object (got {type(parsed).__name__})"
-                return parsed, None
-            except json.JSONDecodeError:
-                return None, "No JSON object found in response"
-            except Exception:
-                return None, "No JSON object found in response"
+            return None, "No JSON object found in response"
         js = sanitize_jsonish(js)
         parsed = json.loads(js)
         if not isinstance(parsed, dict):
@@ -252,15 +282,24 @@ def must_mention_file(line: str, allowed_files: List[str]) -> bool:
 
 def mentions_only_allowed_files(line: str, allowed_files: List[str]) -> bool:
     """
-    Conservative: if line mentions a path with a known extension,
+    Conservative: if line mentions a file-like path,
     ensure every mentioned path is within allowed_files.
     """
     import re
-    paths = re.findall(r"[\w./-]+\.(?:py|yml|yaml|kt|java|md)", line or "")
+
+    paths = re.findall(
+        r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.[A-Za-z][A-Za-z0-9]{0,7}",
+        line or "",
+    )
     if not paths:
         return True
-    allowed_set = set(allowed_files)
-    return all(p in allowed_set for p in paths)
+
+    allowed_set = {f.lower() for f in allowed_files}
+    for path in paths:
+        normalized = path.strip("`'\"()[]{}<>,:;!?").rstrip(".").lower()
+        if normalized and normalized not in allowed_set:
+            return False
+    return True
 
 
 def diff_facts(diff: str, allowed_files: List[str], max_lines: int = 60) -> str:
@@ -323,6 +362,8 @@ def filter_bullets_by_fact_gate(items: List[str], diff_lower: str, allowed_files
             if not s:
                 continue
             if allowed_files and not mentions_only_allowed_files(s, allowed_files):
+                continue
+            if STRICT_FACT_GATING and not gate_claims_to_diff(s, diff_lower):
                 continue
             out.append(s)
             break

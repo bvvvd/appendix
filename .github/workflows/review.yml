@@ -29,7 +29,9 @@ jobs:
         run: |
           $pr = "${{ github.event.pull_request.number }}"
           $comments = gh api repos/${{ github.repository }}/issues/$pr/comments | ConvertFrom-Json
-          $ai = $comments | Where-Object { $_.body -match "Reviewed-Head-SHA:" } | Select-Object -Last 1
+          $ai = $comments | Where-Object {
+            $_.body -match "AI_REVIEW:HEAD_SHA=" -or $_.body -match "Reviewed-Head-SHA:"
+          } | Select-Object -Last 1
           if ($null -ne $ai) {
             $m = [regex]::Match($ai.body, "AI_REVIEW:HEAD_SHA=([0-9a-fA-F]{7,40})")
             if ($m.Success) {
@@ -45,19 +47,39 @@ jobs:
         run: |
           git fetch origin ${{ github.base_ref }} --depth=1
 
+          $baseRange = "origin/${{ github.base_ref }}...HEAD"
+          $diffBuilt = $false
+
           if ($env:PREV_SHA) {
             # Validate that PREV_SHA exists in this checkout (force-push can break it)
-            git cat-file -e "$env:PREV_SHA^{commit}" 2>$null
+            git cat-file -e "$($env:PREV_SHA)^{commit}" 2>$null
             if ($LASTEXITCODE -eq 0) {
-              git diff --unified=3 $env:PREV_SHA...HEAD > diff.txt
-              Write-Host "Using incremental diff: $env:PREV_SHA...HEAD"
+              # Ensure PREV_SHA is still in the current branch history.
+              git merge-base --is-ancestor "$env:PREV_SHA" HEAD 2>$null
+              if ($LASTEXITCODE -eq 0) {
+                $incrementalRange = "$($env:PREV_SHA)...HEAD"
+                git diff --unified=3 "$incrementalRange" > diff.txt
+                if ($LASTEXITCODE -eq 0) {
+                  Write-Host "Using incremental diff: $incrementalRange"
+                  $diffBuilt = $true
+                } else {
+                  Write-Host "Incremental diff command failed. Falling back to full diff."
+                }
+              } else {
+                Write-Host "PREV_SHA is not an ancestor of HEAD. Falling back to full diff."
+              }
             } else {
               Write-Host "PREV_SHA not found locally (maybe force-push). Falling back to full diff."
-              git diff --unified=3 origin/${{ github.base_ref }}...HEAD > diff.txt
             }
-          } else {
-            git diff --unified=3 origin/${{ github.base_ref }}...HEAD > diff.txt
-            Write-Host "Using full PR diff against base."
+          }
+
+          if (-not $diffBuilt) {
+            git diff --unified=3 "$baseRange" > diff.txt
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "Failed to build diff for range: $baseRange"
+              exit 1
+            }
+            Write-Host "Using full PR diff against base: $baseRange"
           }
 
           Get-Content diff.txt | Measure-Object -Line -Word -Character | Format-List
