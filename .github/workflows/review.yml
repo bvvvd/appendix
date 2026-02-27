@@ -29,7 +29,9 @@ jobs:
         run: |
           $pr = "${{ github.event.pull_request.number }}"
           $comments = gh api repos/${{ github.repository }}/issues/$pr/comments | ConvertFrom-Json
-          $ai = $comments | Where-Object { $_.body -match "Reviewed-Head-SHA:" } | Select-Object -Last 1
+          $ai = $comments | Where-Object {
+            $_.body -match "AI_REVIEW:HEAD_SHA=" -or $_.body -match "Reviewed-Head-SHA:"
+          } | Select-Object -Last 1
           if ($null -ne $ai) {
             $m = [regex]::Match($ai.body, "AI_REVIEW:HEAD_SHA=([0-9a-fA-F]{7,40})")
             if ($m.Success) {
